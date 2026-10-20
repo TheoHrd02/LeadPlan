@@ -46,7 +46,22 @@ QUERIES = [
     ("sauna", "sauna"),
     ("tatoueur", "body_art_service"),
     ("piercing", "body_art_service"),
+    # Bien-être Planity : Google les classe en "health"/"service" → texte seul, sans filtre de type.
+    ("réflexologue", None),
+    ("massothérapeute", None),
+    ("sophrologue", None),
+    ("hypnothérapeute", None),
+    ("naturopathe", None),
+    ("coach de vie", None),
 ]
+
+# Catégorie principale Google acceptée. Le reste (hôtel, camping, restaurant, pisciniste, clinique,
+# magasin...) remonte via un type secondaire "spa"/"bien-être" → écarté. "health"/"service" = bien-être.
+ALLOWED_TYPES = {
+    "hair_salon", "hair_care", "barber_shop", "beauty_salon", "beautician", "nail_salon", "makeup_artist",
+    "massage", "massage_spa", "spa", "sauna", "wellness_center", "skin_care_clinic", "tanning_studio",
+    "body_art_service", "foot_care", "health", "service",
+}
 
 VAR_BBOX = (42.97, 5.65, 43.82, 6.95)  # sud, ouest, nord, est
 CELL_DEG = 0.1          # grille initiale ~8 x 11 km
@@ -59,7 +74,7 @@ WORKERS = 3             # ~450 req/min, sous le quota par défaut de ~600/min
 # SKU "Text Search Essentials (IDs Only)" = gratuit illimité.
 # Ajouter un seul champ ici fait basculer en SKU payant. Ne pas toucher.
 SEARCH_FIELDS = "places.id,nextPageToken"
-DETAIL_FIELDS = ("id,displayName,formattedAddress,addressComponents,primaryTypeDisplayName,"
+DETAIL_FIELDS = ("id,displayName,formattedAddress,addressComponents,primaryType,primaryTypeDisplayName,"
                  "businessStatus,googleMapsUri,nationalPhoneNumber,websiteUri,userRatingCount")
 
 
@@ -121,11 +136,12 @@ def split(cell):
 def search_cell(query, place_type, cell):
     s, w, n, e = cell
     body = {
-        "textQuery": query, "includedType": place_type, "strictTypeFiltering": True,
-        "languageCode": "fr", "regionCode": "FR", "pageSize": 20,
+        "textQuery": query, "languageCode": "fr", "regionCode": "FR", "pageSize": 20,
         "locationRestriction": {"rectangle": {"low": {"latitude": s, "longitude": w},
                                               "high": {"latitude": n, "longitude": e}}},
     }
+    if place_type:
+        body |= {"includedType": place_type, "strictTypeFiltering": True}
     ids, requests = set(), 0
     while True:
         resp = api("https://places.googleapis.com/v1/places:searchText", SEARCH_FIELDS, body)
@@ -148,7 +164,7 @@ def sweep_query(query, place_type, bbox):
                 stack += [(sub, depth + 1) for sub in split(cell)]
             else:
                 print(f"  ! cellule saturée à profondeur max : {query} {cell}")
-    print(f"  {query:<20} {place_type:<18} {len(ids):>5} fiches  {requests:>4} requêtes")
+    print(f"  {query:<20} {place_type or '(texte seul)':<18} {len(ids):>5} fiches  {requests:>4} requêtes")
     return ids
 
 
@@ -191,6 +207,8 @@ def classify(place):
         return "out_of_zone"
     if place.get("businessStatus", "OPERATIONAL") != "OPERATIONAL":
         return "closed"
+    if place.get("primaryType", "service") not in ALLOWED_TYPES:
+        return "off_target"
     return "sent"
 
 
@@ -281,8 +299,13 @@ def main():
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-email", action="store_true")
     parser.add_argument("--bbox", type=lambda s: tuple(map(float, s.split(","))), default=VAR_BBOX)
+    parser.add_argument("--log", type=Path, help="ajoute la sortie à ce fichier (tâche planifiée via pythonw)")
     args = parser.parse_args()
-    sys.stdout.reconfigure(encoding="utf-8")
+    if args.log:
+        sys.stdout = sys.stderr = open(ROOT / args.log, "a", encoding="utf-8", buffering=1)
+        print(f"\n=== {time.strftime('%Y-%m-%d %H:%M')} ===")
+    else:
+        sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv()
     today = date.today()
     state = load_state()

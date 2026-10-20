@@ -35,8 +35,9 @@ Contenu de l'email :
 | sauna | `sauna` |
 | tatoueur | `body_art_service` |
 | piercing | `body_art_service` |
+| réflexologue, massothérapeute, sophrologue, hypnothérapeute, naturopathe, coach de vie | aucun (texte seul) |
 
-Liste modifiable en tête de script. Autres types dispo si besoin : `hair_care`, `foot_care`.
+Cible = métiers Planity. Les métiers bien-être sont classés « santé »/« service » par Google → requête texte sans filtre de type, et toute fiche dont la catégorie principale Google n'est pas dans la liste blanche `ALLOWED_TYPES` est écartée à l'étape détails (`off_target`) : hôtels, campings, restaurants, piscinistes, cliniques, kinés, magasins… (ils remontent via un type secondaire « spa »/« bien-être »). Tatouage/piercing conservés à la demande. Cils, épilation, manucure, drainage en institut : déjà couverts par `beauty_salon` / `beautician` / `nail_salon` / `massage` (vérifié sur Toulon). Liste modifiable en tête de script ; **tout ajout de requête impose un `--baseline`** sinon l'existant remonte comme « nouveau ». Autres types dispo si besoin : `hair_care`, `foot_care`.
 
 ---
 
@@ -64,7 +65,7 @@ Si la vraie date de création légale compte → module SIRENE (§6, prévu en V
 | Langage | Python 3.12, **stdlib uniquement** (`urllib`, `json`, `smtplib`, `email`, `csv`) | Zéro dépendance à installer/maintenir |
 | Données Google | **Places API (New)** — Text Search + Place Details | Seule API Google officielle pour les fiches |
 | Stockage état | `data/seen.json` commité dans le repo | Pas de BDD ; Google autorise le stockage illimité des `place_id` |
-| Planification + exécution | **GitHub Actions** (cron hebdo), repo privé | Gratuit (2 000 min/mois en privé, on en consomme ~60) |
+| Planification + exécution | **Planificateur de tâches Windows** (lundi 8h) ; GitHub Actions prêt mais désactivé (§3.6) | Gratuit ; PC allumé requis |
 | Email | **Gmail SMTP** + mot de passe d'application | Gratuit, rien à configurer côté domaine |
 
 ### 3.2 Coût Google — pourquoi c'est gratuit
@@ -106,7 +107,10 @@ Pour chaque `place_id` nouveau (absent de `seen.json`) :
 Filtres :
 1. Code postal ne commence pas par `83` → `out_of_zone`, pas envoyé.
 2. `businessStatus` ≠ `OPERATIONAL` → `closed`, pas envoyé.
-3. `userRatingCount` ≤ 5 → section **Nouvelles fiches probables** ; sinon → **À vérifier**. Seuil configurable.
+3. `primaryType` hors `ALLOWED_TYPES` → `off_target`, pas envoyé.
+4. `userRatingCount` ≤ 5 → section **Nouvelles fiches probables** ; sinon → **À vérifier**. Seuil configurable.
+
+Bruit attendu : Google ne renvoie pas exactement les mêmes fiches d'un balayage à l'autre (mesuré : 53 → 46 → 11 → 15 « nouvelles » sur des passages rapprochés sans aucune création). Chaque passage les absorbe dans `seen.json`, le bruit décroît mais ne tombe jamais à zéro.
 
 
 ### 3.5 État — `data/seen.json`
@@ -123,9 +127,20 @@ Filtres :
 Statuts : `baseline`, `pending` (détails pas encore récupérés, plafond atteint), `sent`, `out_of_zone`, `closed`.
 On ne stocke **que** `place_id` + date + statut (conforme aux CGU Google, cf. §7). Les détails sont relus à chaque envoi, jamais archivés.
 
-### 3.6 Exécution — GitHub Actions
+### 3.6 Exécution — Planificateur de tâches Windows (actif)
 
-`.github/workflows/weekly.yml` :
+GitHub Actions bloqué (problème de facturation du compte GitHub) → exécution locale.
+
+- Tâche `LeadPlan` : lundi 08:00 (heure du PC), `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet.
+- `pythonw` → aucune fenêtre ; sortie et erreurs ajoutées à `leadplan.log` (ignoré par git).
+- PC éteint ou en veille à 8h → lancée dès qu'il redémarre (« StartWhenAvailable »). Échec → 3 relances à 30 min d'intervalle.
+- Pas d'email un lundi = échec (l'email part même avec 0 lead) → lire `leadplan.log`.
+- `data/seen.json` reste local ; le commiter de temps en temps sert de sauvegarde.
+- Lancer à la main : `Start-ScheduledTask LeadPlan`. Supprimer : `Unregister-ScheduledTask LeadPlan`.
+
+### 3.6 bis GitHub Actions (désactivé, à réactiver une fois la facturation réglée)
+
+`.github/workflows/weekly.yml` (réactiver : `gh workflow enable weekly-leads`, puis supprimer la tâche Windows) :
 - `schedule: cron "0 6 * * 1"` (lundi 06:00 UTC = 7h/8h Paris) + `workflow_dispatch` pour lancer à la main.
 - Steps : checkout → `python leadplan.py` → commit/push de `data/seen.json`.
 - Secrets : `API_KEY_GOOGLE_CLOUD`, `APP_PASSWORD_GOOGLE`, `GMAIL_ADDRESS`, `MAIL_TO` (optionnel, défaut = `GMAIL_ADDRESS`).

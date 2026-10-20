@@ -25,6 +25,9 @@ class LeadPlanTest(unittest.TestCase):
         self.assertEqual(leadplan.classify(place("83400", "CLOSED_PERMANENTLY")), "closed")
         self.assertEqual(leadplan.classify({"formattedAddress": "1 Rue X, 83990 Saint-Tropez"}), "sent")
         self.assertEqual(leadplan.classify(None), "gone")
+        for off in ("physiotherapist", "hotel", "campground", "restaurant", "general_contractor"):
+            self.assertEqual(leadplan.classify({**place("83000"), "primaryType": off}), "off_target")
+        self.assertEqual(leadplan.classify({**place("83000"), "primaryType": "body_art_service"}), "sent")
 
 
 if __name__ == "__main__":
