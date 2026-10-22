@@ -1,9 +1,11 @@
 """LeadPlan — nouveaux leads beauté / bien-être dans le Var, envoyés par email chaque jour.
 
-Deux sources :
+Trois sources :
   - Google Places : fiches apparues depuis le dernier passage (diff de place_id).
   - SIRENE via l'API Recherche d'entreprises (gratuite, sans clé) : établissements créés récemment
     en coiffure / soins de beauté / entretien corporel.
+  - BODACC (gratuit, sans clé) : annonces de création et de reprise dont l'activité décrite est une
+    prestation beauté / bien-être — capte les indépendants multi-activités et le bien-être que SIRENE rate.
 
 Usage :
   python leadplan.py --baseline        indexe l'existant (Google + SIRENE), n'envoie rien
@@ -25,6 +27,7 @@ import re
 import smtplib
 import sys
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -37,6 +40,7 @@ from pathlib import Path
 ROOT = Path(__file__).parent
 STATE_FILE = ROOT / "data" / "seen.json"
 SIRENE_STATE_FILE = ROOT / "data" / "sirene_seen.json"
+BODACC_STATE_FILE = ROOT / "data" / "bodacc_seen.json"
 USAGE_FILE = ROOT / "data" / "usage.json"
 
 # (requête texte, type Google Table A) — filtrage strict sur le type.
@@ -97,6 +101,26 @@ NAF_CODES = {"96.02A": "Coiffure", "96.02B": "Soins de beauté", "96.04Z": "Entr
 NAF25_CODES = {"96.21G": "Coiffure", "96.21H": "Coiffure", "96.22Y": "Soins de beauté", "96.23Y": "Entretien corporel"}
 SIRENE_MAX_AGE_DAYS = 120  # SIRET jamais vu mais créé avant → pas un lead (changement d'activité, etc.)
 
+# BODACC : pas de code NAF, seulement l'activité en texte libre.
+BODACC_URL = "https://bodacc-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/annonces-commerciales/records"
+BODACC_DAYS = 14  # fenêtre de parution relue chaque jour (PC éteint quelques jours, diff sur l'id d'annonce)
+# Recherche plein texte côté API, volontairement large ; le tri fin est fait par SERVICE_RE / RETAIL_RE.
+BODACC_WORDS = ["coiffure", "coiffeur", "coiffeuse", "barbier", "esthétique", "esthéticienne", "beauté", "onglerie",
+                "ongles", "ongulaire", "manucure", "cils", "épilation", "maquillage", "massage", "drainage",
+                "réflexologie", "sophrologie", "naturopathie", "hypnose", "spa", "sauna", "tatouage", "piercing",
+                "bronzage"]
+# Texte sans accents. Un morceau d'activité compte si une prestation y est citée avant toute vente ou travaux :
+# « coiffure en salon, achat vente d'accessoires » → oui ; « vente en ligne de produits de beauté, maquillage » → non.
+SERVICE_RE = re.compile(
+    r"coiff|barbi|barber|esthetici|(soins?|prestations?|institut|salon|centre)\s+(de\s+)?(technico-)?esthet|"
+    r"esthetique en institut|institut de beaute|(soins?|prestations?) de beaute|beaute des (ongles|mains|pieds)|"
+    r"onglerie|ongulaire|manucur|pedicur|\bongles\b|\bcils\b|sourcils|epilation|maquill|massage|drainage lymph|"
+    r"reflexolog|sophrolog|naturopath|hypno|\bspa\b|sauna|tatou|piercing|percage|dermopigment|bronzage|"
+    r"coach(ing)? de vie")
+RETAIL_RE = re.compile(r"vente|commerc|achat|negoce|distribution|intermediaire|en ligne|a distance|internet|"
+                       r"materiel|accessoire|produit|article|fabrication|import|installation|maintenance|"
+                       r"depannage|reparation|piscine|travaux")
+
 
 def load_dotenv():
     path = ROOT / ".env"
@@ -124,7 +148,7 @@ def http_json(req):
             if e.code not in (429, 500, 502, 503, 504) or attempt == 7:
                 print(f"HTTP {e.code} {req.full_url}\n{e.read().decode(errors='replace')[:800]}", file=sys.stderr)
                 raise
-        except urllib.error.URLError:
+        except OSError:  # réseau : URLError, TimeoutError en lecture, connexion coupée
             if attempt == 7:
                 raise
         time.sleep(min(2 ** attempt, 60))  # 429 = quota/minute dépassé
@@ -289,7 +313,96 @@ def sirene_diff(found, seen, today):
     return leads
 
 
+# --- BODACC ----------------------------------------------------------------
+
+def bodacc_fetch(today):
+    """Annonces de création / reprise du Var parues sur la fenêtre, indexées par id d'annonce."""
+    since = (today - timedelta(days=BODACC_DAYS)).isoformat()
+    where = (f'numerodepartement="83" and dateparution>="{since}" '
+             f'and familleavis in ("creation","immatriculation","vente") and ('
+             + " or ".join(f'search(listeetablissements,"{w}")' for w in BODACC_WORDS) + ")")
+    records, offset = [], 0
+    while True:
+        query = urllib.parse.urlencode({"where": where, "limit": 100, "offset": offset})
+        page = http_json(urllib.request.Request(f"{BODACC_URL}?{query}", headers={"User-Agent": "LeadPlan"}))
+        records += page.get("results", [])
+        offset += 100
+        if offset >= page.get("total_count", 0):
+            print(f"  BODACC {len(records)} annonces")
+            return {r["id"]: r for r in records}
+
+
+def plain(text):
+    return "".join(c for c in unicodedata.normalize("NFKD", text.lower()) if not unicodedata.combining(c))
+
+
+def bodacc_relevant(activity):
+    """Au moins une activité (morceaux séparés par « - », « ; » ou « . ») commence par une prestation ciblée."""
+    for chunk in re.split(r"\s[-–]\s|;|\.(?:\s|$)", plain(activity)):
+        service, retail = SERVICE_RE.search(chunk), RETAIL_RE.search(chunk)
+        if service and (not retail or service.start() < retail.start()):
+            return True
+    return False
+
+
+def first(value):  # BODACC : un objet seul ou une liste d'objets
+    return (value[0] if isinstance(value, list) else value) or {}
+
+
+def bodacc_row(record):
+    etab = first(json.loads(record.get("listeetablissements") or "{}").get("etablissement"))
+    person = first(json.loads(record.get("listepersonnes") or "{}").get("personne"))
+    acte = json.loads(record.get("acte") or "{}")
+    siren = re.sub(r"\D", "", person.get("numeroImmatriculation", {}).get("numeroIdentification", ""))
+    if not siren:
+        siren = (re.findall(r"\d{9}", str(record.get("registre") or "")) or [""])[0]
+    prenom = person.get("prenom") or ""
+    prenom = prenom[0] if isinstance(prenom, list) else prenom.split(",")[0]  # texte "A, B" ou liste ["A", "B"]
+    name = (etab.get("enseigne") or etab.get("nomCommercial") or person.get("denomination")
+            or " ".join(filter(None, [prenom, person.get("nom")])))
+    commune = record.get("ville") or ""
+    return {
+        "nom": name,
+        "type": "Reprise" if record.get("familleavis") == "vente" else "Création",
+        "activite": etab.get("activite") or "",
+        "commune": commune,
+        "code_postal": record.get("cp") or "",
+        "debut_activite": acte.get("dateCommencementActivite") or "",
+        "publie_le": record.get("dateparution") or "",
+        "siren": siren,
+        "annonce": record.get("url_complete") or "",
+        "recherche_google": maps_search(name, commune),
+    }
+
+
+def bodacc_diff(found, seen, today, sirene_sirens):
+    """Annonces jamais vues et ciblées. Une création déjà connue de SIRENE ou une société déjà envoyée = doublon."""
+    already = {v.get("siren") for v in seen.values() if v["status"] == "sent"}
+    leads = []
+    for ann_id, record in found.items():
+        if ann_id in seen:
+            continue
+        row = bodacc_row(record)
+        if not bodacc_relevant(row["activite"]):
+            status = "off_target"
+        elif row["siren"] in already or (row["type"] == "Création" and row["siren"] in sirene_sirens):
+            status = "dup"
+        else:
+            status = "sent"
+            already.add(row["siren"])
+            leads.append(row)
+        seen[ann_id] = {"first_seen": today.isoformat(), "status": status, "siren": row["siren"]}
+    return leads
+
+
 # --- Email -----------------------------------------------------------------
+
+def maps_search(name, commune):
+    return "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{name} {commune}")
+
+
+def fr_date(iso):  # date future = ouverture prévue
+    return "/".join(reversed(iso.split("-"))) if iso else ""
 
 def google_row(place):
     return {
@@ -317,7 +430,7 @@ def sirene_row(etab):
         "cree_le": etab.get("date_creation") or "",
         "siret": etab["siret"],
         "fiche_officielle": f"https://annuaire-entreprises.data.gouv.fr/etablissement/{etab['siret']}",
-        "recherche_google": "https://www.google.com/maps/search/?api=1&query=" + urllib.parse.quote(f"{name} {commune}"),
+        "recherche_google": maps_search(name, commune),
     }
 
 
@@ -337,7 +450,15 @@ SIRENE_COLUMNS = [
     ("Nom", lambda r: link(r["fiche_officielle"], r["nom"])),
     ("Activité", lambda r: escape(r["activite"])),
     ("Adresse", lambda r: escape(r["adresse"])),
-    ("Créé le", lambda r: escape("/".join(reversed(r["cree_le"].split("-"))))),  # date future = ouverture prévue
+    ("Créé le", lambda r: escape(fr_date(r["cree_le"]))),
+    ("Google", lambda r: link(r["recherche_google"], "chercher")),
+]
+BODACC_COLUMNS = [
+    ("Nom", lambda r: link(r["annonce"], r["nom"])),
+    ("Type", lambda r: escape(r["type"])),
+    ("Activité", lambda r: escape(r["activite"][:120] + ("…" if len(r["activite"]) > 120 else ""))),
+    ("Commune", lambda r: escape(f"{r['commune']} ({r['code_postal']})")),
+    ("Début d'activité", lambda r: escape(fr_date(r["debut_activite"]))),
     ("Google", lambda r: link(r["recherche_google"], "chercher")),
 ]
 
@@ -365,33 +486,39 @@ def plural(n, word):
     return f"{n} {word}{'s' if n > 1 else ''}"
 
 
-def build_email(places, etabs, today, test=False, sirene_error=None):
+def build_email(places, etabs, annonces, today, test=False, errors=None):
     rows = sorted((google_row(p) for p in places), key=lambda r: (r["commune"], r["nom"]))
     fresh = [r for r in rows if r["avis"] <= NEW_MAX_REVIEWS]
     check = [r for r in rows if r["avis"] > NEW_MAX_REVIEWS]
     created = sorted((sirene_row(e) for e in etabs), key=lambda r: r["cree_le"], reverse=True)
+    annonces = sorted(annonces, key=lambda r: r["publie_le"], reverse=True)
 
     msg = EmailMessage()
     msg["Subject"] = (f"{'[TEST] ' if test else ''}LeadPlan {today:%d/%m} — {plural(len(created), 'création')}, "
-                      f"{plural(len(fresh), 'fiche')} Google")
+                      f"{len(annonces)} BODACC, {plural(len(fresh), 'fiche')} Google")
     msg["From"] = env("GMAIL_ADDRESS")
     msg["To"] = os.environ.get("MAIL_TO") or env("GMAIL_ADDRESS")
-    warning = (f"<p style='color:#b00'>⚠️ SIRENE indisponible aujourd'hui : {escape(sirene_error)}</p>"
-               if sirene_error else "")
+    warning = "".join(f"<p style='color:#b00'>⚠️ {source} indisponible aujourd'hui : {escape(error)}</p>"
+                      for source, error in (errors or {}).items())
     html = (f"<div style='font-family:Arial,sans-serif'>{warning}"
             f"<h2>Créations d'entreprises ({len(created)})</h2>{html_table(created, SIRENE_COLUMNS)}"
+            f"<h2>Annonces légales BODACC ({len(annonces)})</h2>{html_table(annonces, BODACC_COLUMNS)}"
             f"<h2>Nouvelles fiches Google probables ({len(fresh)})</h2>{html_table(fresh, GOOGLE_COLUMNS)}"
             f"<h2>Fiches Google à vérifier — déjà des avis ({len(check)})</h2>{html_table(check, GOOGLE_COLUMNS)}"
             f"<p style='color:#888;font-size:12px'>Créations : établissements immatriculés depuis moins de "
-            f"{SIRENE_MAX_AGE_DAYS} jours (source SIRENE / INSEE), apparus depuis hier. Pas de téléphone dans "
-            f"SIRENE : « chercher » ouvre Google Maps. Fiches Google : apparues depuis le dernier passage ; "
+            f"{SIRENE_MAX_AGE_DAYS} jours (source SIRENE / INSEE), apparus depuis hier ; date future = ouverture "
+            f"prévue. BODACC : créations et reprises de fonds publiées au journal officiel dont l'activité décrite "
+            f"est une prestation beauté / bien-être, hors doublons avec SIRENE. Pas de téléphone dans ces deux "
+            f"sources : « chercher » ouvre Google Maps. Fiches Google : apparues depuis le dernier passage ; "
             f"« À vérifier » = plus de {NEW_MAX_REVIEWS} avis, probablement une fiche ancienne.</p></div>")
-    msg.set_content(f"{len(created)} créations, {len(fresh)} fiches Google, {len(check)} à vérifier. "
-                    f"Voir la version HTML ou les CSV joints.")
+    msg.set_content(f"{len(created)} créations, {len(annonces)} annonces BODACC, {len(fresh)} fiches Google, "
+                    f"{len(check)} à vérifier. Voir la version HTML ou les CSV joints.")
     msg.add_alternative(html, subtype="html")
 
     if created:
         msg.add_attachment(csv_bytes(created), maintype="text", subtype="csv", filename=f"creations-{today}.csv")
+    if annonces:
+        msg.add_attachment(csv_bytes(annonces), maintype="text", subtype="csv", filename=f"bodacc-{today}.csv")
     if rows:
         section = lambda r: "nouveau" if r["avis"] <= NEW_MAX_REVIEWS else "a_verifier"
         msg.add_attachment(csv_bytes(fresh + check, section), maintype="text", subtype="csv",
@@ -434,7 +561,8 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv()
     today = date.today()
-    google_seen, sirene_seen, usage = load_json(STATE_FILE), load_json(SIRENE_STATE_FILE), load_json(USAGE_FILE)
+    google_seen, sirene_seen = load_json(STATE_FILE), load_json(SIRENE_STATE_FILE)
+    bodacc_seen, usage = load_json(BODACC_STATE_FILE), load_json(USAGE_FILE)
     used = usage.setdefault(today.strftime("%Y-%m"), {"pro": 0, "enterprise": 0})
 
     if args.test_email:
@@ -445,7 +573,8 @@ def main():
             used["enterprise"] += 1
         save_json(USAGE_FILE, usage)
         etabs = sorted(sirene_sweep().values(), key=lambda e: e.get("date_creation") or "", reverse=True)[:5]
-        msg, html = build_email(places, etabs, today, test=True)
+        annonces = [row for row in map(bodacc_row, bodacc_fetch(today).values()) if bodacc_relevant(row["activite"])]
+        msg, html = build_email(places, etabs, annonces, today, test=True)
         if args.dry_run:
             (ROOT / "preview.html").write_text(html, "utf-8")
             print("Aperçu : preview.html (rien envoyé)")
@@ -458,25 +587,36 @@ def main():
         sys.exit("Aucun état : lance d'abord `python leadplan.py --baseline`.")
 
     started = time.time()
+    errors = {}  # SIRENE ou BODACC en panne ne doivent pas bloquer les autres sources
+
+    def safe(source, fetch):
+        try:
+            return fetch()
+        except Exception as e:
+            errors[source] = f"{type(e).__name__}: {e}"
+            print(f"{source} indisponible : {errors[source]}")
+            return {}
+
     with ThreadPoolExecutor(1) as pool:  # SIRENE (~6 min) en parallèle du balayage Google (~6 min)
-        sirene_job = pool.submit(sirene_sweep)
+        sirene_job = pool.submit(safe, "SIRENE", sirene_sweep)
         found = sweep(args.bbox)
         print(f"{len(found)} fiches Google uniques en {time.time() - started:.0f}s")
-        try:
-            sirene_found, sirene_error = sirene_job.result(), None
-        except Exception as e:  # SIRENE en panne ne doit pas bloquer les leads Google
-            sirene_found, sirene_error = {}, f"{type(e).__name__}: {e}"
-            print(f"SIRENE indisponible : {sirene_error}")
+        bodacc_found = safe("BODACC", lambda: bodacc_fetch(today))
+        sirene_found = sirene_job.result()
 
     if args.baseline:
         for pid in found:
             google_seen.setdefault(pid, {"first_seen": today.isoformat(), "status": "baseline"})
         for siret in sirene_found:
             sirene_seen.setdefault(siret, {"first_seen": today.isoformat(), "status": "baseline"})
+        for ann_id in bodacc_found:
+            bodacc_seen.setdefault(ann_id, {"first_seen": today.isoformat(), "status": "baseline"})
         if not args.dry_run:
             save_json(STATE_FILE, google_seen)
             save_json(SIRENE_STATE_FILE, sirene_seen)
-        print(f"Baseline : {len(google_seen)} fiches Google, {len(sirene_seen)} établissements SIRENE")
+            save_json(BODACC_STATE_FILE, bodacc_seen)
+        print(f"Baseline : {len(google_seen)} fiches Google, {len(sirene_seen)} établissements SIRENE, "
+              f"{len(bodacc_seen)} annonces BODACC")
         return
 
     for pid in found - google_seen.keys():
@@ -496,7 +636,14 @@ def main():
     save_json(USAGE_FILE, usage)  # appels réellement consommés, même en dry-run
 
     creations = sirene_diff(sirene_found, sirene_seen, today)
-    msg, html = build_email(leads, creations, today, sirene_error=sirene_error)
+    # BODACC a parfois quelques jours d'avance : une société déjà envoyée par BODACC ne revient pas via SIRENE.
+    bodacc_sent = {v.get("siren") for v in bodacc_seen.values() if v["status"] == "sent"}
+    for etab in [e for e in creations if e["siret"][:9] in bodacc_sent]:
+        sirene_seen[etab["siret"]]["status"] = "dup"
+        creations.remove(etab)
+    annonces = bodacc_diff(bodacc_found, bodacc_seen, today, {siret[:9] for siret in sirene_seen})
+
+    msg, html = build_email(leads, creations, annonces, today, errors=errors)
     print(f"{msg['Subject']} | usage du mois : {used}")
     if args.dry_run:
         (ROOT / "preview.html").write_text(html, "utf-8")
@@ -505,6 +652,7 @@ def main():
     send(msg)
     save_json(STATE_FILE, google_seen)
     save_json(SIRENE_STATE_FILE, sirene_seen)
+    save_json(BODACC_STATE_FILE, bodacc_seen)
 
 
 if __name__ == "__main__":

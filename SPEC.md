@@ -1,6 +1,6 @@
 # LeadPlan — Spécification
 
-Email quotidien listant les nouveaux leads beauté / bien-être (métiers Planity) dans le Var (83) : créations d'entreprises officielles (SIRENE) + nouvelles fiches Google. Pas d'interface. Coût cible : 0 €.
+Email quotidien listant les nouveaux leads beauté / bien-être (métiers Planity) dans le Var (83) : créations d'entreprises officielles (SIRENE), annonces légales de création et de reprise (BODACC) + nouvelles fiches Google. Pas d'interface. Coût cible : 0 €.
 
 ---
 
@@ -12,6 +12,7 @@ Email quotidien listant les nouveaux leads beauté / bien-être (métiers Planit
 Contenu de l'email :
 - Objet : `LeadPlan 22/10 — 2 créations, 3 fiches Google`
 - Section **Créations d'entreprises** (SIRENE, §6) : établissements apparus depuis hier et créés il y a moins de 120 jours. Nom (lien fiche officielle annuaire-entreprises) · Activité · Adresse · Date de création · lien « chercher » sur Google Maps (pas de téléphone dans SIRENE).
+- Section **Annonces légales BODACC** (§6 bis) : créations et reprises de fonds dont l'activité décrite est une prestation beauté / bien-être, hors doublons SIRENE. Nom (lien annonce) · Type · Activité · Commune · Début d'activité · « chercher ».
 - Section **Nouvelles fiches Google probables** (≤ 5 avis Google) : tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Lien Google Maps.
 - Section **Fiches Google à vérifier** (> 5 avis) : fiches détectées pour la première fois mais visiblement anciennes (changement de catégorie, nouvelle place ID, trou de couverture).
 - Pièces jointes `creations-2026-10-22.csv` et `google-2026-10-22.csv` (import CRM / tableur).
@@ -216,6 +217,15 @@ Google ne sait pas *quand* une entreprise est créée ; SIRENE (INSEE) si, offic
 - **Limites** : pas de téléphone (lien « chercher » sur Google Maps à la place) ; bien-être hors NAF beauté (sophrologue, naturopathe… souvent en 86.90F) non couvert par SIRENE, seulement par Google ; délai de quelques jours à quelques semaines entre création et apparition dans SIRENE.
 - SIRENE en panne → l'email part quand même avec les leads Google et un avertissement.
 - V3 possible : rapprocher une création SIRENE d'une fiche Google (nom + commune) pour récupérer le téléphone.
+
+## 6 bis. BODACC (annonces légales) — en place
+
+Complément de SIRENE, pas un remplaçant. Mesuré sur 30 jours dans le Var (22/10/2026) : 35 créations SIRENE beauté, 47 créations BODACC repérées par mots-clés, **5 en commun seulement**. SIRENE seul : surtout des artisans (coiffeuses, esthéticiennes) non inscrits au registre du commerce. BODACC seul : beaucoup de bruit (vente de cosmétiques en ligne, etc.) mais de vrais leads que SIRENE rate : indépendants multi-activités dont le code NAF principal n'est pas la beauté (cils + coursier, prothésiste ongulaire + véhicules), bien-être (naturopathie, hypnose, drainage lymphatique), et sociétés publiées au BODACC avant d'apparaître dans SIRENE.
+
+- **Source** : API BODACC (opendatasoft, DILA), gratuite, sans clé. Familles `creation`, `immatriculation`, `vente` (reprises de fonds), département 83, parutions des 14 derniers jours relues chaque jour, diff sur l'id d'annonce (`data/bodacc_seen.json`). Pas de baseline : le premier passage envoie les annonces pertinentes des 14 derniers jours.
+- **Filtre d'activité** (texte libre, pas de code NAF) : l'activité est découpée en morceaux (« - », « ; », « . ») ; un morceau compte si une prestation ciblée (`SERVICE_RE` : coiffure, esthéticienne, soins esthétiques, onglerie, cils, épilation, massage, drainage lymphatique, naturopathie, hypnose, tatouage, perçage…) y est citée **avant** toute notion de vente ou de travaux (`RETAIL_RE`). Ex. « coiffure - vente de produits » → oui ; « vente en ligne de produits de beauté, maquillage » → non. Vérifié sur les 55 annonces réelles du mois : 20 gardées, toutes pertinentes, 24 écartées.
+- **Dédoublonnage** : une création dont le SIREN est déjà connu de SIRENE est écartée ; une société déjà envoyée via BODACC n'est pas renvoyée ensuite par SIRENE. Les reprises sont gardées même si l'acheteur est connu (nouveau propriétaire = nouveau lead).
+- **Volume attendu** : ~5 leads BODACC par semaine en plus de SIRENE.
 
 ---
 
