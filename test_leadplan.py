@@ -1,4 +1,5 @@
 import unittest
+from datetime import date
 
 import leadplan
 
@@ -28,6 +29,16 @@ class LeadPlanTest(unittest.TestCase):
         for off in ("physiotherapist", "hotel", "campground", "restaurant", "general_contractor"):
             self.assertEqual(leadplan.classify({**place("83000"), "primaryType": off}), "off_target")
         self.assertEqual(leadplan.classify({**place("83000"), "primaryType": "body_art_service"}), "sent")
+
+    def test_sirene_diff(self):
+        today = date(2026, 10, 22)
+        found = {"1": {"date_creation": "2026-10-01"}, "2": {"date_creation": "2010-01-01"}}
+        seen = {}
+        self.assertEqual(leadplan.sirene_diff(found, seen, today), [])  # premier passage = baseline
+        found |= {"3": {"date_creation": "2026-10-21"}, "4": {"date_creation": "2015-03-01"}}
+        self.assertEqual(leadplan.sirene_diff(found, seen, today), [found["3"]])
+        self.assertEqual(seen["4"]["status"], "old")
+        self.assertEqual(leadplan.sirene_diff(found, seen, today), [])  # déjà vus
 
 
 if __name__ == "__main__":

@@ -1,20 +1,21 @@
 # LeadPlan — Spécification
 
-Email hebdomadaire listant les nouvelles fiches Google (coiffure, esthétique, massage, beauté) apparues dans le Var (83). Pas d'interface. Coût cible : 0 €.
+Email quotidien listant les nouveaux leads beauté / bien-être (métiers Planity) dans le Var (83) : créations d'entreprises officielles (SIRENE) + nouvelles fiches Google. Pas d'interface. Coût cible : 0 €.
 
 ---
 
 ## 1. Fonctionnel
 
 **Entrée** : rien (tâche planifiée).
-**Sortie** : 1 email par semaine, lundi ~8h (heure de Paris).
+**Sortie** : 1 email par jour, ~8h (heure du PC).
 
 Contenu de l'email :
-- Objet : `LeadPlan — 23 nouveaux leads Var (sem. 43)`
-- Section **Nouvelles fiches probables** (≤ 5 avis Google) : tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Lien Google Maps.
-- Section **À vérifier** (> 5 avis) : fiches détectées pour la première fois mais visiblement anciennes (changement de catégorie, nouvelle place ID, trou de couverture).
-- Pièce jointe `leads-2026-W43.csv` (import CRM / tableur).
-- Si 0 lead : email envoyé quand même (« 0 nouveau lead ») → preuve que le pipeline tourne.
+- Objet : `LeadPlan 22/10 — 2 créations, 3 fiches Google`
+- Section **Créations d'entreprises** (SIRENE, §6) : établissements apparus depuis hier et créés il y a moins de 120 jours. Nom (lien fiche officielle annuaire-entreprises) · Activité · Adresse · Date de création · lien « chercher » sur Google Maps (pas de téléphone dans SIRENE).
+- Section **Nouvelles fiches Google probables** (≤ 5 avis Google) : tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Lien Google Maps.
+- Section **Fiches Google à vérifier** (> 5 avis) : fiches détectées pour la première fois mais visiblement anciennes (changement de catégorie, nouvelle place ID, trou de couverture).
+- Pièces jointes `creations-2026-10-22.csv` et `google-2026-10-22.csv` (import CRM / tableur).
+- Si 0 lead : email envoyé quand même → preuve que le pipeline tourne.
 
 **Secteurs couverts** (couples requête texte / type Google, filtrage strict) :
 
@@ -65,7 +66,7 @@ Si la vraie date de création légale compte → module SIRENE (§6, prévu en V
 | Langage | Python 3.12, **stdlib uniquement** (`urllib`, `json`, `smtplib`, `email`, `csv`) | Zéro dépendance à installer/maintenir |
 | Données Google | **Places API (New)** — Text Search + Place Details | Seule API Google officielle pour les fiches |
 | Stockage état | `data/seen.json` commité dans le repo | Pas de BDD ; Google autorise le stockage illimité des `place_id` |
-| Planification + exécution | **Planificateur de tâches Windows** (lundi 8h) ; GitHub Actions prêt mais désactivé (§3.6) | Gratuit ; PC allumé requis |
+| Planification + exécution | **Planificateur de tâches Windows** (tous les jours 8h) ; GitHub Actions prêt mais désactivé (§3.6) | Gratuit ; PC allumé requis |
 | Email | **Gmail SMTP** + mot de passe d'application | Gratuit, rien à configurer côté domaine |
 
 ### 3.2 Coût Google — pourquoi c'est gratuit
@@ -74,13 +75,14 @@ Tarifs Places API (New), vérifiés le 20/10/2026 :
 
 | SKU | Gratuit / mois | Usage LeadPlan |
 |---|---|---|
-| Text Search **Essentials (IDs Only)** | **Illimité** | Le balayage hebdo complet (~2 500–5 000 requêtes) |
-| Place Details **Enterprise** | 1 000 | Détails des nouvelles fiches uniquement (~20–100 / sem.) |
+| Text Search **Essentials (IDs Only)** | **Illimité** | Le balayage quotidien complet (~3 000 requêtes/jour) |
+| Place Details **Pro** | 5 000 | 1er appel sur chaque nouvelle fiche : nom, adresse, catégorie → filtres |
+| Place Details **Enterprise** | 1 000 | 2e appel, fiches retenues seulement : téléphone, site, avis |
 
 Règle d'or : le balayage demande **uniquement** `places.id,nextPageToken` dans le field mask. Ajouter un seul champ (ex. `displayName`) bascule en SKU Pro payant au-delà de 5 000/mois. → constante figée + test.
 
 Garde-fous :
-1. Plafond code : max **200** Place Details par exécution (≤ 870/mois < 1 000). Le surplus reste `pending` pour la semaine suivante.
+1. Budget mensuel compté dans `data/usage.json` : 4 500 Pro / 900 Enterprise (marge sous les quotas gratuits). Budget atteint → les fiches restantes restent `pending` jusqu'au mois suivant. Valable quel que soit le nombre de lancements (quotidien + manuels).
 2. Quota Google Cloud : limiter « Place Details » à ~250 req/jour.
 3. Alerte budget Google Cloud à 1 €.
 
@@ -101,8 +103,8 @@ Estimation (15 requêtes × ~117 cellules + pagination + découpages) : ~2 500�
 
 Pour chaque `place_id` nouveau (absent de `seen.json`) :
 
-`GET places/{id}` avec field mask :
-`displayName,formattedAddress,addressComponents,primaryTypeDisplayName,businessStatus,googleMapsUri,nationalPhoneNumber,websiteUri,userRatingCount`
+1. `GET places/{id}` (Pro) : `displayName,formattedAddress,addressComponents,primaryType,primaryTypeDisplayName,businessStatus,googleMapsUri` → filtres ci-dessous (~50 % écartées).
+2. Fiche retenue seulement : `GET places/{id}` (Enterprise) : `nationalPhoneNumber,websiteUri,userRatingCount`.
 
 Filtres :
 1. Code postal ne commence pas par `83` → `out_of_zone`, pas envoyé.
@@ -131,17 +133,17 @@ On ne stocke **que** `place_id` + date + statut (conforme aux CGU Google, cf. §
 
 GitHub Actions bloqué (problème de facturation du compte GitHub) → exécution locale.
 
-- Tâche `LeadPlan` : lundi 08:00 (heure du PC), `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet.
+- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC), `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet.
 - `pythonw` → aucune fenêtre ; sortie et erreurs ajoutées à `leadplan.log` (ignoré par git).
 - PC éteint ou en veille à 8h → lancée dès qu'il redémarre (« StartWhenAvailable »). Échec → 3 relances à 30 min d'intervalle.
-- Pas d'email un lundi = échec (l'email part même avec 0 lead) → lire `leadplan.log`.
+- Pas d'email un matin = échec (l'email part même avec 0 lead) → lire `leadplan.log`.
 - `data/seen.json` reste local ; le commiter de temps en temps sert de sauvegarde.
 - Lancer à la main : `Start-ScheduledTask LeadPlan`. Supprimer : `Unregister-ScheduledTask LeadPlan`.
 
 ### 3.6 bis GitHub Actions (désactivé, à réactiver une fois la facturation réglée)
 
 `.github/workflows/weekly.yml` (réactiver : `gh workflow enable weekly-leads`, puis supprimer la tâche Windows) :
-- `schedule: cron "0 6 * * 1"` (lundi 06:00 UTC = 7h/8h Paris) + `workflow_dispatch` pour lancer à la main.
+- `schedule: cron "0 6 * * *"` (tous les jours 06:00 UTC = 7h/8h Paris) + `workflow_dispatch` pour lancer à la main.
 - Steps : checkout → `python leadplan.py` → commit/push de `data/seen.json`.
 - Secrets : `API_KEY_GOOGLE_CLOUD`, `APP_PASSWORD_GOOGLE`, `GMAIL_ADDRESS`, `MAIL_TO` (optionnel, défaut = `GMAIL_ADDRESS`).
 - Échec du workflow → GitHub envoie un email d'échec automatiquement.
@@ -201,19 +203,19 @@ Total dev : ~1 journée. Premier email utile : semaine suivant la baseline.
 
 ---
 
-## 6. V2 : module SIRENE (INSEE)
+## 6. V2 : créations d'entreprises (SIRENE) — en place
 
-Décidé : hors V1. Prérequis le moment venu : compte portail-api.insee.fr + clé API Sirene (gratuite, 30 req/min), secret `INSEE_API_KEY`. ~1 h de dev → section « Créations officielles » dans le même email.
+Google ne sait pas *quand* une entreprise est créée ; SIRENE (INSEE) si, officiellement. Même source que société.com, mais gratuite.
 
-Google ne sait pas *quand* une entreprise est créée ; SIRENE si, officiellement, gratuitement.
-
-- API Sirene (INSEE), requête hebdo unique :
-  `periode(activitePrincipaleEtablissement:(96.02A OR 96.02B OR 96.04Z)) AND codePostalEtablissement:83* AND dateCreationEtablissement:[J-60 TO J]`
-  - 96.02A Coiffure · 96.02B Soins de beauté · 96.04Z Entretien corporel (spa, massage non médical).
-  - Fenêtre 60 jours + diff sur SIRET déjà vus (même mécanique que Google) → absorbe le délai d'enregistrement.
-- **Bascule NAF 2025 début janvier 2027** : les codes changent (aucun code commun avec NAF 2008). Filtrer aussi sur le groupe NAF 2025 `96.2x` (coiffure / soins de beauté / spa) — codes exacts à confirmer sur la table de correspondance INSEE avant le 1er janvier 2027.
-- Limites : pas de téléphone ; certains entrepreneurs individuels en diffusion partielle (nom/adresse masqués) ; beaucoup d'esthéticiennes à domicile n'ont jamais de fiche Google → SIRENE les capte, Google non.
-- V2 possible : rapprocher un lead SIRENE d'une fiche Google (nom + commune) pour récupérer le téléphone.
+- **Source** : API [Recherche d'entreprises](https://recherche-entreprises.api.gouv.fr) (État, celle d'annuaire-entreprises.data.gouv.fr). Gratuite, **sans clé**, 7 req/s. (L'API Sirene de l'INSEE exige une clé : écartée.)
+- **Requête** : `activite_principale` ∈ {96.02A Coiffure, 96.02B Soins de beauté, 96.04Z Entretien corporel} × `departement=83` × `etat_administratif=A`, paginée (25/page, ~260 pages, ~6 min, en parallèle du balayage Google).
+- **Filtre établissement** : actif, code postal 83, activité de l'*établissement* ciblée (une société de coiffure peut avoir une holding ou un local commercial dans le Var : écartés).
+- **Diff** sur SIRET (`data/sirene_seen.json`) : SIRET jamais vu **et** créé il y a moins de 120 jours → lead ; jamais vu mais ancien → `old` (changement d'activité, déménagement), pas envoyé. Premier passage = baseline silencieuse.
+- **Volume mesuré** (22/10/2026) : 5 876 établissements actifs ; 4 créés en 7 jours, 35 en 30 jours (12 coiffure, 17 beauté, 6 entretien corporel), 183 en 120 jours → ~1 création/jour.
+- **NAF 2025 (bascule janvier 2027)** : correspondances relevées dans les données : 96.02A → 96.21G / 96.21H, 96.02B → 96.22Y, 96.04Z → 96.23Y. Le filtre établissement accepte déjà les deux. L'API refuse aujourd'hui les codes NAF25 en paramètre ; à la bascule, l'erreur apparaîtra en rouge dans l'email → remplacer `NAF_CODES` par les codes NAF25.
+- **Limites** : pas de téléphone (lien « chercher » sur Google Maps à la place) ; bien-être hors NAF beauté (sophrologue, naturopathe… souvent en 86.90F) non couvert par SIRENE, seulement par Google ; délai de quelques jours à quelques semaines entre création et apparition dans SIRENE.
+- SIRENE en panne → l'email part quand même avec les leads Google et un avertissement.
+- V3 possible : rapprocher une création SIRENE d'une fiche Google (nom + commune) pour récupérer le téléphone.
 
 ---
 
