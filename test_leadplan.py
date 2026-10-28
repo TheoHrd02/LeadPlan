@@ -30,6 +30,18 @@ class LeadPlanTest(unittest.TestCase):
         for off in ("physiotherapist", "hotel", "campground", "restaurant", "general_contractor"):
             self.assertEqual(leadplan.classify({**place("83000"), "primaryType": off}), "off_target")
         self.assertEqual(leadplan.classify({**place("83000"), "primaryType": "body_art_service"}), "sent")
+        for name in ("Maureen Erhardy Ostéopathe D.O.", "Cabinet Sage Femme CASTILLO", "CABINET INFIRMIER ESCRIHUELA",
+                     "Fayoux Caroline - Cabinet de psychothérapie", "Provencianne aide à domicile"):
+            self.assertEqual(leadplan.classify({**place("83000"), "displayName": {"text": name}}), "off_target", name)
+        self.assertEqual(leadplan.classify({**place("83000"), "displayName": {"text": "Myriam Castrec Réflexologue"}}),
+                         "sent")
+
+    def test_too_old(self):
+        today = date(2026, 10, 28)
+        reviews = lambda *days: {"reviews": [{"publishTime": f"{d}T10:00:00Z"} for d in days]}
+        self.assertTrue(leadplan.too_old(reviews("2026-10-20", "2021-03-18"), today))  # un avis de 2021 suffit
+        self.assertFalse(leadplan.too_old(reviews("2026-10-24", "2026-02-19"), today))
+        self.assertFalse(leadplan.too_old({}, today))  # aucun avis : âge inconnu, gardé
 
     def test_sirene_diff(self):
         today = date(2026, 10, 22)

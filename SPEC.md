@@ -13,8 +13,7 @@ Contenu de l'email :
 - Objet : `LeadPlan 22/10 — 2 créations, 3 fiches Google`
 - Section **Créations d'entreprises** (SIRENE, §6) : établissements apparus depuis hier et créés il y a moins de 120 jours. Nom (lien fiche officielle annuaire-entreprises) · Activité · Adresse · Date de création · lien « chercher » sur Google Maps (pas de téléphone dans SIRENE).
 - Section **Annonces légales BODACC** (§6 bis) : créations et reprises de fonds dont l'activité décrite est une prestation beauté / bien-être, hors doublons SIRENE. Nom (lien annonce) · Type · Activité · Commune · Début d'activité · « chercher ».
-- Section **Nouvelles fiches Google probables** (≤ 5 avis Google) : tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Lien Google Maps.
-- Section **Fiches Google à vérifier** (> 5 avis) : fiches détectées pour la première fois mais visiblement anciennes (changement de catégorie, nouvelle place ID, trou de couverture).
+- Section **Nouvelles fiches Google** : fiches jamais vues, hors professions de santé, dont le premier avis a moins d'un an (ou aucun avis). Tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Date du 1er avis · Lien Google Maps.
 - Pièces jointes `creations-2026-10-22.csv` et `google-2026-10-22.csv` (import CRM / tableur).
 - Si 0 lead : email envoyé quand même → preuve que le pipeline tourne.
 
@@ -105,13 +104,14 @@ Estimation (15 requêtes × ~117 cellules + pagination + découpages) : ~2 500�
 Pour chaque `place_id` nouveau (absent de `seen.json`) :
 
 1. `GET places/{id}` (Pro) : `displayName,formattedAddress,addressComponents,primaryType,primaryTypeDisplayName,businessStatus,googleMapsUri` → filtres ci-dessous (~50 % écartées).
-2. Fiche retenue seulement : `GET places/{id}` (Enterprise) : `nationalPhoneNumber,websiteUri,userRatingCount`.
+2. Fiche retenue seulement : `GET places/{id}` (Enterprise + Atmosphere, 1 000 gratuits/mois) : `nationalPhoneNumber,websiteUri,userRatingCount,reviews`.
 
 Filtres :
 1. Code postal ne commence pas par `83` → `out_of_zone`, pas envoyé.
 2. `businessStatus` ≠ `OPERATIONAL` → `closed`, pas envoyé.
 3. `primaryType` hors `ALLOWED_TYPES` → `off_target`, pas envoyé.
-4. `userRatingCount` ≤ 5 → section **Nouvelles fiches probables** ; sinon → **À vérifier**. Seuil configurable.
+4. Nom contenant une profession de santé (`HEALTH_NAME_RE` : ostéopathe, sage-femme, infirmier, psychothérapeute, aide à domicile…) → `off_target` (dès l'appel Pro).
+5. **Âge** : plus ancien avis visible (champ `reviews`, 5 avis max) antérieur à `GOOGLE_MAX_AGE_DAYS` = 365 jours → `old`, pas envoyé. Aucun avis = âge inconnu, gardé. Le nombre d'avis n'est pas un bon indicateur (un salon ouvert cette semaine peut avoir 18 avis) ; la date du premier avis l'est. Mesuré sur les 51 fiches envoyées du 23 au 26/10 : 23 avaient un premier avis de plus d'un an (16 de plus de 3 ans), 9 étaient des professions de santé ; le filtre en garde 26.
 
 Bruit attendu : Google ne renvoie pas exactement les mêmes fiches d'un balayage à l'autre (mesuré : 53 → 46 → 11 → 15 « nouvelles » sur des passages rapprochés sans aucune création). Chaque passage les absorbe dans `seen.json`, le bruit décroît mais ne tombe jamais à zéro.
 
@@ -134,9 +134,10 @@ On ne stocke **que** `place_id` + date + statut (conforme aux CGU Google, cf. §
 
 GitHub Actions bloqué (problème de facturation du compte GitHub) → exécution locale.
 
-- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC), `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet.
+- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC) puis **toutes les heures jusqu'à 23:00**, `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet. Le script sort aussitôt si l'email du jour est déjà parti (`data/last_sent.txt`) → un lancement coupé (redémarrage Windows, veille) est rattrapé à l'heure suivante. Limite d'exécution 45 min.
 - `pythonw` → aucune fenêtre ; sortie et erreurs ajoutées à `leadplan.log` (ignoré par git).
 - PC éteint ou en veille à 8h → lancée dès qu'il redémarre (« StartWhenAvailable »). Échec → 3 relances à 30 min d'intervalle.
+- Incidents des 27-28/10/2026 : redémarrage Windows 1 min après le lancement (non rattrapé à l'époque) ; boucle de pagination infinie de Google sur une requête texte seul (corrigée : `MAX_PAGES`, arrêt sur page sans nouvelle fiche).
 - Pas d'email un matin = échec (l'email part même avec 0 lead) → lire `leadplan.log`.
 - `data/seen.json` reste local ; le commiter de temps en temps sert de sauvegarde.
 - Lancer à la main : `Start-ScheduledTask LeadPlan`. Supprimer : `Unregister-ScheduledTask LeadPlan`.

@@ -26,6 +26,7 @@ import os
 import re
 import smtplib
 import sys
+import threading
 import time
 import unicodedata
 import urllib.error
@@ -42,6 +43,7 @@ STATE_FILE = ROOT / "data" / "seen.json"
 SIRENE_STATE_FILE = ROOT / "data" / "sirene_seen.json"
 BODACC_STATE_FILE = ROOT / "data" / "bodacc_seen.json"
 USAGE_FILE = ROOT / "data" / "usage.json"
+LAST_SENT_FILE = ROOT / "data" / "last_sent.txt"  # la tâche se relance toutes les heures tant que vide
 
 # (requête texte, type Google Table A) — filtrage strict sur le type.
 QUERIES = [
@@ -76,22 +78,28 @@ ALLOWED_TYPES = {
     "massage", "massage_spa", "spa", "sauna", "wellness_center", "skin_care_clinic", "tanning_studio",
     "body_art_service", "foot_care", "health", "service",
 }
+# Professions de santé que les recherches bien-être ramènent sous "health"/"service" : hors cible Planity.
+HEALTH_NAME_RE = re.compile(r"osteo|sage-femme|sage femme|infirmi|\bkine\b|kinesitherap|psycholog|psychothera|"
+                            r"psychiatr|medecin|docteur|\bdr\b|dentist|orthophon|podolog|pharmac|clinique|"
+                            r"hopital|ehpad|veterin|acupunct|aide a domicile")
 
 VAR_BBOX = (42.97, 5.65, 43.82, 6.95)  # sud, ouest, nord, est
 CELL_DEG = 0.1          # grille initiale ~8 x 11 km
 SATURATED = 60          # max de résultats par requête Text Search (3 pages de 20)
+MAX_PAGES = 5           # garde-fou : 3 pages suffisent aujourd'hui
 MAX_DEPTH = 5           # 0.1° / 2^5 ≈ 300 m
-NEW_MAX_REVIEWS = 5     # au-delà → section « À vérifier »
-WORKERS = 3             # ~450 req/min, sous le quota par défaut de ~600/min
+GOOGLE_MAX_AGE_DAYS = 365  # premier avis visible plus ancien → fiche installée depuis longtemps, pas un lead
+WORKERS = 3            # ~450 req/min, sous le quota par défaut de ~600/min
 
 # SKU "Text Search Essentials (IDs Only)" = gratuit illimité.
 # Ajouter un seul champ ici fait basculer en SKU payant. Ne pas toucher.
 SEARCH_FIELDS = "places.id,nextPageToken"
-# Place Details en deux temps : Pro (5 000 gratuits/mois) pour filtrer, Enterprise (1 000/mois)
-# seulement pour les fiches retenues. Budget mensuel compté dans data/usage.json, avec marge.
+# Place Details en deux temps : Pro (5 000 gratuits/mois) pour filtrer, puis seulement pour les fiches
+# retenues téléphone, site et avis (les avis font passer en SKU « Enterprise + Atmosphere », 1 000
+# gratuits/mois, compté sous "enterprise"). Budget mensuel compté dans data/usage.json, avec marge.
 PRO_FIELDS = ("id,displayName,formattedAddress,addressComponents,primaryType,primaryTypeDisplayName,"
               "businessStatus,googleMapsUri")
-ENTERPRISE_FIELDS = "nationalPhoneNumber,websiteUri,userRatingCount"
+ENTERPRISE_FIELDS = "nationalPhoneNumber,websiteUri,userRatingCount,reviews"
 MONTHLY_BUDGET = {"pro": 4500, "enterprise": 900}
 
 # SIRENE. L'API n'accepte que les codes NAF 2008 en filtre ; à la bascule NAF 2025 (janvier 2027)
@@ -100,6 +108,7 @@ SIRENE_URL = "https://recherche-entreprises.api.gouv.fr/search"
 NAF_CODES = {"96.02A": "Coiffure", "96.02B": "Soins de beauté", "96.04Z": "Entretien corporel"}
 NAF25_CODES = {"96.21G": "Coiffure", "96.21H": "Coiffure", "96.22Y": "Soins de beauté", "96.23Y": "Entretien corporel"}
 SIRENE_MAX_AGE_DAYS = 120  # SIRET jamais vu mais créé avant → pas un lead (changement d'activité, etc.)
+SIRENE_MAX_SECONDS = 15 * 60  # au-delà (API qui répond 429), l'email part sans SIRENE ; rattrapé au suivant
 
 # BODACC : pas de code NAF, seulement l'activité en texte libre.
 BODACC_URL = "https://bodacc-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/annonces-commerciales/records"
@@ -190,13 +199,17 @@ def search_cell(query, place_type, cell):
     if place_type:
         body |= {"includedType": place_type, "strictTypeFiltering": True}
     ids, requests = set(), 0
-    while True:
+    # Les requêtes texte seul peuvent renvoyer un nextPageToken indéfiniment sans nouvelle fiche (boucle
+    # sans fin constatée le 28/10/2026) → arrêt dès qu'une page n'apporte rien, et MAX_PAGES au plus.
+    for _ in range(MAX_PAGES):
         resp = api("https://places.googleapis.com/v1/places:searchText", SEARCH_FIELDS, body)
         requests += 1
-        ids.update(p["id"] for p in resp.get("places", []))
-        if not resp.get("nextPageToken"):
-            return ids, requests
+        new = {p["id"] for p in resp.get("places", [])} - ids
+        ids |= new
+        if not new or not resp.get("nextPageToken"):
+            break
         body["pageToken"] = resp["nextPageToken"]
+    return ids, requests
 
 
 def sweep_query(query, place_type, bbox):
@@ -253,19 +266,32 @@ def classify(place):
         return "out_of_zone"
     if place.get("businessStatus", "OPERATIONAL") != "OPERATIONAL":
         return "closed"
-    if place.get("primaryType", "service") not in ALLOWED_TYPES:
+    if place.get("primaryType", "service") not in ALLOWED_TYPES \
+            or HEALTH_NAME_RE.search(plain(place.get("displayName", {}).get("text", ""))):
         return "off_target"
     return "sent"
 
 
-def lookup(place_id, used):
-    """Pro pour filtrer ; Enterprise (téléphone, site, avis) seulement si la fiche est retenue."""
+def first_review(place):
+    """Date du plus ancien avis visible (l'API en renvoie au plus 5) : borne basse de l'âge de la fiche."""
+    return min((r.get("publishTime", "")[:10] for r in place.get("reviews", [])), default="")
+
+
+def too_old(place, today):
+    oldest = first_review(place)
+    return bool(oldest) and oldest < (today - timedelta(days=GOOGLE_MAX_AGE_DAYS)).isoformat()
+
+
+def lookup(place_id, used, today):
+    """Pro pour filtrer ; téléphone, site et avis seulement si la fiche est retenue, puis filtre d'âge."""
     used["pro"] += 1
     place = details(place_id, PRO_FIELDS)
     status = classify(place)
     if status == "sent":
         used["enterprise"] += 1
         place |= details(place_id, ENTERPRISE_FIELDS) or {}
+        if too_old(place, today):
+            status = "old"
     return status, place
 
 
@@ -293,7 +319,7 @@ def sirene_sweep():
                             and str(etab.get("code_postal") or "").startswith("83"):
                         found[etab["siret"]] = {**etab, "nom_complet": company.get("nom_complet") or ""}
             page += 1
-            time.sleep(0.2)  # limite de l'API : 7 requêtes/s
+            time.sleep(0.5)  # limite officielle 7 req/s, mais l'API renvoie des 429 si on la sollicite trop souvent
     print(f"  SIRENE {len(found)} établissements")
     return found
 
@@ -413,6 +439,7 @@ def google_row(place):
         "telephone": place.get("nationalPhoneNumber", ""),
         "site": place.get("websiteUri", ""),
         "avis": place.get("userRatingCount", 0),
+        "premier_avis": first_review(place),
         "google_maps": place.get("googleMapsUri", ""),
     }
 
@@ -445,6 +472,7 @@ GOOGLE_COLUMNS = [
     ("Téléphone", lambda r: link("tel:" + r["telephone"].replace(" ", ""), r["telephone"]) if r["telephone"] else ""),
     ("Site", lambda r: link(r["site"], "site")),
     ("Avis", lambda r: str(r["avis"])),
+    ("1er avis", lambda r: escape(fr_date(r["premier_avis"]) or "aucun")),
 ]
 SIRENE_COLUMNS = [
     ("Nom", lambda r: link(r["fiche_officielle"], r["nom"])),
@@ -472,13 +500,11 @@ def html_table(rows, columns):
     return f"<table style='border-collapse:collapse;font-size:14px'><tr>{head}</tr>{body}</table>"
 
 
-def csv_bytes(rows, section=None):
+def csv_bytes(rows):
     buf = io.StringIO()
-    fields = (["section"] if section else []) + list(rows[0])
-    writer = csv.DictWriter(buf, fields, delimiter=";")
+    writer = csv.DictWriter(buf, list(rows[0]), delimiter=";")
     writer.writeheader()
-    for r in rows:
-        writer.writerow({"section": section(r), **r} if section else r)
+    writer.writerows(rows)
     return buf.getvalue().encode("utf-8-sig")  # Excel FR
 
 
@@ -488,14 +514,12 @@ def plural(n, word):
 
 def build_email(places, etabs, annonces, today, test=False, errors=None):
     rows = sorted((google_row(p) for p in places), key=lambda r: (r["commune"], r["nom"]))
-    fresh = [r for r in rows if r["avis"] <= NEW_MAX_REVIEWS]
-    check = [r for r in rows if r["avis"] > NEW_MAX_REVIEWS]
     created = sorted((sirene_row(e) for e in etabs), key=lambda r: r["cree_le"], reverse=True)
     annonces = sorted(annonces, key=lambda r: r["publie_le"], reverse=True)
 
     msg = EmailMessage()
     msg["Subject"] = (f"{'[TEST] ' if test else ''}LeadPlan {today:%d/%m} — {plural(len(created), 'création')}, "
-                      f"{len(annonces)} BODACC, {plural(len(fresh), 'fiche')} Google")
+                      f"{len(annonces)} BODACC, {plural(len(rows), 'fiche')} Google")
     msg["From"] = env("GMAIL_ADDRESS")
     msg["To"] = os.environ.get("MAIL_TO") or env("GMAIL_ADDRESS")
     warning = "".join(f"<p style='color:#b00'>⚠️ {source} indisponible aujourd'hui : {escape(error)}</p>"
@@ -503,16 +527,16 @@ def build_email(places, etabs, annonces, today, test=False, errors=None):
     html = (f"<div style='font-family:Arial,sans-serif'>{warning}"
             f"<h2>Créations d'entreprises ({len(created)})</h2>{html_table(created, SIRENE_COLUMNS)}"
             f"<h2>Annonces légales BODACC ({len(annonces)})</h2>{html_table(annonces, BODACC_COLUMNS)}"
-            f"<h2>Nouvelles fiches Google probables ({len(fresh)})</h2>{html_table(fresh, GOOGLE_COLUMNS)}"
-            f"<h2>Fiches Google à vérifier — déjà des avis ({len(check)})</h2>{html_table(check, GOOGLE_COLUMNS)}"
+            f"<h2>Nouvelles fiches Google ({len(rows)})</h2>{html_table(rows, GOOGLE_COLUMNS)}"
             f"<p style='color:#888;font-size:12px'>Créations : établissements immatriculés depuis moins de "
             f"{SIRENE_MAX_AGE_DAYS} jours (source SIRENE / INSEE), apparus depuis hier ; date future = ouverture "
             f"prévue. BODACC : créations et reprises de fonds publiées au journal officiel dont l'activité décrite "
             f"est une prestation beauté / bien-être, hors doublons avec SIRENE. Pas de téléphone dans ces deux "
-            f"sources : « chercher » ouvre Google Maps. Fiches Google : apparues depuis le dernier passage ; "
-            f"« À vérifier » = plus de {NEW_MAX_REVIEWS} avis, probablement une fiche ancienne.</p></div>")
-    msg.set_content(f"{len(created)} créations, {len(annonces)} annonces BODACC, {len(fresh)} fiches Google, "
-                    f"{len(check)} à vérifier. Voir la version HTML ou les CSV joints.")
+            f"sources : « chercher » ouvre Google Maps. Fiches Google : apparues depuis le dernier passage, "
+            f"hors professions de santé et hors fiches dont le premier avis a plus d'un an ; « 1er avis » = date "
+            f"du plus ancien avis visible (« aucun » = âge inconnu).</p></div>")
+    msg.set_content(f"{len(created)} créations, {len(annonces)} annonces BODACC, {len(rows)} fiches Google. "
+                    f"Voir la version HTML ou les CSV joints.")
     msg.add_alternative(html, subtype="html")
 
     if created:
@@ -520,9 +544,7 @@ def build_email(places, etabs, annonces, today, test=False, errors=None):
     if annonces:
         msg.add_attachment(csv_bytes(annonces), maintype="text", subtype="csv", filename=f"bodacc-{today}.csv")
     if rows:
-        section = lambda r: "nouveau" if r["avis"] <= NEW_MAX_REVIEWS else "a_verifier"
-        msg.add_attachment(csv_bytes(fresh + check, section), maintype="text", subtype="csv",
-                           filename=f"google-{today}.csv")
+        msg.add_attachment(csv_bytes(rows), maintype="text", subtype="csv", filename=f"google-{today}.csv")
     return msg, html
 
 
@@ -585,6 +607,10 @@ def main():
 
     if not google_seen and not args.baseline:
         sys.exit("Aucun état : lance d'abord `python leadplan.py --baseline`.")
+    if not (args.baseline or args.dry_run) and LAST_SENT_FILE.exists() \
+            and LAST_SENT_FILE.read_text().strip() == today.isoformat():
+        print("Email du jour déjà envoyé, rien à faire.")
+        return
 
     started = time.time()
     errors = {}  # SIRENE ou BODACC en panne ne doivent pas bloquer les autres sources
@@ -597,12 +623,21 @@ def main():
             print(f"{source} indisponible : {errors[source]}")
             return {}
 
-    with ThreadPoolExecutor(1) as pool:  # SIRENE (~6 min) en parallèle du balayage Google (~6 min)
-        sirene_job = pool.submit(safe, "SIRENE", sirene_sweep)
-        found = sweep(args.bbox)
-        print(f"{len(found)} fiches Google uniques en {time.time() - started:.0f}s")
-        bodacc_found = safe("BODACC", lambda: bodacc_fetch(today))
-        sirene_found = sirene_job.result()
+    # SIRENE (~6 min) en parallèle du balayage Google (~6 min), dans un thread démon pour ne jamais
+    # bloquer l'envoi : l'API limite parfois fortement (429), on n'attend pas au-delà de SIRENE_MAX_SECONDS.
+    sirene_result = {}
+    sirene_thread = threading.Thread(target=lambda: sirene_result.update(found=safe("SIRENE", sirene_sweep)),
+                                     daemon=True)
+    sirene_thread.start()
+    found = sweep(args.bbox)
+    print(f"{len(found)} fiches Google uniques en {time.time() - started:.0f}s")
+    bodacc_found = safe("BODACC", lambda: bodacc_fetch(today))
+    sirene_thread.join(timeout=max(0, SIRENE_MAX_SECONDS - (time.time() - started)))
+    if sirene_thread.is_alive():
+        errors["SIRENE"] = "API trop lente aujourd'hui (limite de requêtes) : les créations arriveront au prochain email"
+        print(errors["SIRENE"])
+    sirene_found = sirene_result.get("found", {})
+    errors_now = dict(errors)  # copie : le thread SIRENE, s'il tourne encore, peut écrire dans l'original
 
     if args.baseline:
         for pid in found:
@@ -629,7 +664,7 @@ def main():
         if any(used[k] >= MONTHLY_BUDGET[k] for k in MONTHLY_BUDGET):
             print(f"Budget Google du mois atteint ({used}) : le reste attend le mois prochain")
             break
-        status, place = lookup(pid, used)
+        status, place = lookup(pid, used, today)
         google_seen[pid]["status"] = status
         if status == "sent":
             leads.append(place)
@@ -643,13 +678,14 @@ def main():
         creations.remove(etab)
     annonces = bodacc_diff(bodacc_found, bodacc_seen, today, {siret[:9] for siret in sirene_seen})
 
-    msg, html = build_email(leads, creations, annonces, today, errors=errors)
+    msg, html = build_email(leads, creations, annonces, today, errors=errors_now)
     print(f"{msg['Subject']} | usage du mois : {used}")
     if args.dry_run:
         (ROOT / "preview.html").write_text(html, "utf-8")
         print("Aperçu : preview.html (rien envoyé, état non sauvegardé)")
         return
     send(msg)
+    LAST_SENT_FILE.write_text(today.isoformat())
     save_json(STATE_FILE, google_seen)
     save_json(SIRENE_STATE_FILE, sirene_seen)
     save_json(BODACC_STATE_FILE, bodacc_seen)
