@@ -40,7 +40,9 @@ class LeadPlanTest(unittest.TestCase):
         today = date(2026, 10, 28)
         reviews = lambda *days: {"reviews": [{"publishTime": f"{d}T10:00:00Z"} for d in days]}
         self.assertTrue(leadplan.too_old(reviews("2026-10-20", "2021-03-18"), today))  # un avis de 2021 suffit
-        self.assertFalse(leadplan.too_old(reviews("2026-10-24", "2026-02-19"), today))
+        self.assertTrue(leadplan.too_old(reviews("2025-12-29"), today))   # envoyé à tort le 29/10 (seuil d'un an)
+        self.assertTrue(leadplan.too_old(reviews("2026-07-20"), today))   # 3 mois : pas « nouveau »
+        self.assertFalse(leadplan.too_old(reviews("2026-10-24", "2026-10-02"), today))
         self.assertFalse(leadplan.too_old({}, today))  # aucun avis : âge inconnu, gardé
 
     def test_sirene_diff(self):
@@ -52,6 +54,22 @@ class LeadPlanTest(unittest.TestCase):
         self.assertEqual(leadplan.sirene_diff(found, seen, today), [found["3"]])
         self.assertEqual(seen["4"]["status"], "old")
         self.assertEqual(leadplan.sirene_diff(found, seen, today), [])  # déjà vus
+
+    def test_insee_etab(self):
+        raw = {"siret": "12345678900011", "dateCreationEtablissement": "2026-10-20",
+               "activitePrincipaleNAF25Etablissement": "96.22Y",
+               "uniteLegale": {"denominationUniteLegale": None, "prenom1UniteLegale": "JULIE", "nomUniteLegale": "MARTIN"},
+               "adresseEtablissement": {"numeroVoieEtablissement": "12", "typeVoieEtablissement": "RUE",
+                                        "libelleVoieEtablissement": "DES LILAS", "codePostalEtablissement": "83000",
+                                        "libelleCommuneEtablissement": "TOULON"},
+               "periodesEtablissement": [{"etatAdministratifEtablissement": "A", "activitePrincipaleEtablissement": "96.02B",
+                                          "enseigne1Etablissement": "JULIE BEAUTE"}]}
+        etab = leadplan.insee_etab(raw)
+        self.assertEqual((etab["nom_commercial"], etab["nom_complet"], etab["adresse"]),
+                         ("JULIE BEAUTE", "JULIE MARTIN", "12 RUE DES LILAS 83000 TOULON"))
+        self.assertEqual(leadplan.sirene_row(etab)["activite"], "Soins de beauté")
+        raw["periodesEtablissement"][0]["etatAdministratifEtablissement"] = "F"  # fermé depuis
+        self.assertIsNone(leadplan.insee_etab(raw))
 
     def test_bodacc_relevant(self):
         # Activités réelles parues au BODACC dans le Var (octobre 2026).

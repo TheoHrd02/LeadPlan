@@ -13,7 +13,7 @@ Contenu de l'email :
 - Objet : `LeadPlan 22/10 — 2 créations, 3 fiches Google`
 - Section **Créations d'entreprises** (SIRENE, §6) : établissements apparus depuis hier et créés il y a moins de 120 jours. Nom (lien fiche officielle annuaire-entreprises) · Activité · Adresse · Date de création · lien « chercher » sur Google Maps (pas de téléphone dans SIRENE).
 - Section **Annonces légales BODACC** (§6 bis) : créations et reprises de fonds dont l'activité décrite est une prestation beauté / bien-être, hors doublons SIRENE. Nom (lien annonce) · Type · Activité · Commune · Début d'activité · « chercher ».
-- Section **Nouvelles fiches Google** : fiches jamais vues, hors professions de santé, dont le premier avis a moins d'un an (ou aucun avis). Tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Date du 1er avis · Lien Google Maps.
+- Section **Nouvelles fiches Google** : fiches jamais vues, hors professions de santé, dont le premier avis a moins de 60 jours (ou aucun avis). Tableau Nom · Catégorie · Commune · Téléphone · Site · Nb avis · Date du 1er avis · Lien Google Maps.
 - Pièces jointes `creations-2026-10-22.csv` et `google-2026-10-22.csv` (import CRM / tableur).
 - Si 0 lead : email envoyé quand même → preuve que le pipeline tourne.
 
@@ -111,7 +111,7 @@ Filtres :
 2. `businessStatus` ≠ `OPERATIONAL` → `closed`, pas envoyé.
 3. `primaryType` hors `ALLOWED_TYPES` → `off_target`, pas envoyé.
 4. Nom contenant une profession de santé (`HEALTH_NAME_RE` : ostéopathe, sage-femme, infirmier, psychothérapeute, aide à domicile…) → `off_target` (dès l'appel Pro).
-5. **Âge** : plus ancien avis visible (champ `reviews`, 5 avis max) antérieur à `GOOGLE_MAX_AGE_DAYS` = 365 jours → `old`, pas envoyé. Aucun avis = âge inconnu, gardé. Le nombre d'avis n'est pas un bon indicateur (un salon ouvert cette semaine peut avoir 18 avis) ; la date du premier avis l'est. Mesuré sur les 51 fiches envoyées du 23 au 26/10 : 23 avaient un premier avis de plus d'un an (16 de plus de 3 ans), 9 étaient des professions de santé ; le filtre en garde 26.
+5. **Âge** : plus ancien avis visible (champ `reviews`, 5 avis max) antérieur à `GOOGLE_MAX_AGE_DAYS` = **60 jours** → `old`, pas envoyé (seuil d'un an jusqu'au 29/10 : laissait passer des fiches avec un premier avis de fin 2025 ; on ne veut que des fiches nouvelles). Aucun avis = âge inconnu, gardé. Le nombre d'avis n'est pas un bon indicateur (un salon ouvert cette semaine peut avoir 18 avis) ; la date du premier avis l'est. Mesuré sur les 51 fiches envoyées du 23 au 26/10 : 23 avaient un premier avis de plus d'un an (16 de plus de 3 ans), 9 étaient des professions de santé ; le filtre en garde 26.
 
 Bruit attendu : Google ne renvoie pas exactement les mêmes fiches d'un balayage à l'autre (mesuré : 53 → 46 → 11 → 15 « nouvelles » sur des passages rapprochés sans aucune création). Chaque passage les absorbe dans `seen.json`, le bruit décroît mais ne tombe jamais à zéro.
 
@@ -134,7 +134,7 @@ On ne stocke **que** `place_id` + date + statut (conforme aux CGU Google, cf. §
 
 GitHub Actions bloqué (problème de facturation du compte GitHub) → exécution locale.
 
-- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC) puis **toutes les heures jusqu'à 23:00**, `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet. Le script sort aussitôt si l'email du jour est déjà parti (`data/last_sent.txt`) → un lancement coupé (redémarrage Windows, veille) est rattrapé à l'heure suivante. Limite d'exécution 45 min.
+- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC) puis **toutes les heures jusqu'à 23:00**, `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet. Le script sort aussitôt si l'email du jour est déjà parti (`data/last_sent.txt`) ; s'il est parti sans SIRENE (API trop lente, `last_sent.txt` = « date sirene »), la relance suivante refait SIRENE seul et envoie un email « complément » avec les créations → un lancement coupé (redémarrage Windows, veille) est rattrapé à l'heure suivante. Limite d'exécution 45 min.
 - `pythonw` → aucune fenêtre ; sortie et erreurs ajoutées à `leadplan.log` (ignoré par git).
 - PC éteint ou en veille à 8h → lancée dès qu'il redémarre (« StartWhenAvailable »). Échec → 3 relances à 30 min d'intervalle.
 - Incidents des 27-28/10/2026 : redémarrage Windows 1 min après le lancement (non rattrapé à l'époque) ; boucle de pagination infinie de Google sur une requête texte seul (corrigée : `MAX_PAGES`, arrêt sur page sans nouvelle fiche).
@@ -209,7 +209,8 @@ Total dev : ~1 journée. Premier email utile : semaine suivant la baseline.
 
 Google ne sait pas *quand* une entreprise est créée ; SIRENE (INSEE) si, officiellement. Même source que société.com, mais gratuite.
 
-- **Source** : API [Recherche d'entreprises](https://recherche-entreprises.api.gouv.fr) (État, celle d'annuaire-entreprises.data.gouv.fr). Gratuite, **sans clé**, 7 req/s. (L'API Sirene de l'INSEE exige une clé : écartée.)
+- **Source principale (depuis le 29/10/2026)** : API Sirene de l'INSEE (`api.insee.fr/api-sirene/3.11/siret`), clé gratuite `INSEE_API_KEY` (portail-api.insee.fr, application « Simple », plan Public), en-tête `X-INSEE-Api-Key-Integration`. **Une seule requête par jour** : `codePostalEtablissement:83* AND dateCreationEtablissement:[J-120 TO J+365] AND periode((NAF 2008 ou NAF 2025 ciblés) AND etatAdministratifEtablissement:A)` → ~190 établissements en ~5 s ; la période en cours doit être active et dans une activité ciblée. Codes NAF 2025 déjà inclus : la bascule de janvier 2027 ne casse rien.
+- **Secours sans clé** (ancienne source) : API [Recherche d'entreprises](https://recherche-entreprises.api.gouv.fr) (État, celle d'annuaire-entreprises.data.gouv.fr). Gratuite, **sans clé**, 7 req/s. (L'API Sirene de l'INSEE exige une clé : écartée.)
 - **Requête** : `activite_principale` ∈ {96.02A Coiffure, 96.02B Soins de beauté, 96.04Z Entretien corporel} × `departement=83` × `etat_administratif=A`, paginée (25/page, ~260 pages, ~6 min, en parallèle du balayage Google).
 - **Filtre établissement** : actif, code postal 83, activité de l'*établissement* ciblée (une société de coiffure peut avoir une holding ou un local commercial dans le Var : écartés).
 - **Diff** sur SIRET (`data/sirene_seen.json`) : SIRET jamais vu **et** créé il y a moins de 120 jours → lead ; jamais vu mais ancien → `old` (changement d'activité, déménagement), pas envoyé. Premier passage = baseline silencieuse.
@@ -217,6 +218,7 @@ Google ne sait pas *quand* une entreprise est créée ; SIRENE (INSEE) si, offic
 - **NAF 2025 (bascule janvier 2027)** : correspondances relevées dans les données : 96.02A → 96.21G / 96.21H, 96.02B → 96.22Y, 96.04Z → 96.23Y. Le filtre établissement accepte déjà les deux. L'API refuse aujourd'hui les codes NAF25 en paramètre ; à la bascule, l'erreur apparaîtra en rouge dans l'email → remplacer `NAF_CODES` par les codes NAF25.
 - **Limites** : pas de téléphone (lien « chercher » sur Google Maps à la place) ; bien-être hors NAF beauté (sophrologue, naturopathe… souvent en 86.90F) non couvert par SIRENE, seulement par Google ; délai de quelques jours à quelques semaines entre création et apparition dans SIRENE.
 - SIRENE en panne → l'email part quand même avec les leads Google et un avertissement.
+- **Fiabilité (constatée les 27-29/10/2026)** : l'API répond en ~1,5 s par page, mais par moments en 20-35 s ou en 429 (surcharge côté État, aucun en-tête de limite ni Retry-After ; nous sommes très en dessous de 7 req/s). Avec ~260 pages par passage, ces périodes bloquaient le script 25-40 min. Désormais : 15 s max par page, 1 seul nouvel essai, 8 min max au total (`SIRENE_MAX_SECONDS`), progression dans le journal ; au-delà, abandon net, email sans SIRENE, et la relance horaire retente SIRENE seul (email « complément »). Solution de fond : API Sirene de l'INSEE (clé gratuite) avec filtre sur la date de création → 1 requête par jour au lieu de 260.
 - V3 possible : rapprocher une création SIRENE d'une fiche Google (nom + commune) pour récupérer le téléphone.
 
 ## 6 bis. BODACC (annonces légales) — en place

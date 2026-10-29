@@ -43,7 +43,9 @@ STATE_FILE = ROOT / "data" / "seen.json"
 SIRENE_STATE_FILE = ROOT / "data" / "sirene_seen.json"
 BODACC_STATE_FILE = ROOT / "data" / "bodacc_seen.json"
 USAGE_FILE = ROOT / "data" / "usage.json"
-LAST_SENT_FILE = ROOT / "data" / "last_sent.txt"  # la tâche se relance toutes les heures tant que vide
+# "2026-10-29" = email du jour parti ; "2026-10-29 sirene" = parti sans SIRENE (API trop lente), la relance
+# horaire suivante refait SIRENE seul et envoie un complément.
+LAST_SENT_FILE = ROOT / "data" / "last_sent.txt"
 
 # (requête texte, type Google Table A) — filtrage strict sur le type.
 QUERIES = [
@@ -88,7 +90,7 @@ CELL_DEG = 0.1          # grille initiale ~8 x 11 km
 SATURATED = 60          # max de résultats par requête Text Search (3 pages de 20)
 MAX_PAGES = 5           # garde-fou : 3 pages suffisent aujourd'hui
 MAX_DEPTH = 5           # 0.1° / 2^5 ≈ 300 m
-GOOGLE_MAX_AGE_DAYS = 365  # premier avis visible plus ancien → fiche installée depuis longtemps, pas un lead
+GOOGLE_MAX_AGE_DAYS = 60  # premier avis visible plus ancien → fiche qui n'est pas nouvelle, pas un lead
 WORKERS = 3            # ~450 req/min, sous le quota par défaut de ~600/min
 
 # SKU "Text Search Essentials (IDs Only)" = gratuit illimité.
@@ -108,7 +110,14 @@ SIRENE_URL = "https://recherche-entreprises.api.gouv.fr/search"
 NAF_CODES = {"96.02A": "Coiffure", "96.02B": "Soins de beauté", "96.04Z": "Entretien corporel"}
 NAF25_CODES = {"96.21G": "Coiffure", "96.21H": "Coiffure", "96.22Y": "Soins de beauté", "96.23Y": "Entretien corporel"}
 SIRENE_MAX_AGE_DAYS = 120  # SIRET jamais vu mais créé avant → pas un lead (changement d'activité, etc.)
-SIRENE_MAX_SECONDS = 15 * 60  # au-delà (API qui répond 429), l'email part sans SIRENE ; rattrapé au suivant
+# Source principale : API Sirene de l'INSEE (clé gratuite INSEE_API_KEY, 30 req/min) → une seule requête
+# filtrée sur le Var, les codes NAF et la date de création. Secours sans clé : API Recherche d'entreprises.
+INSEE_URL = "https://api.insee.fr/api-sirene/3.11/siret"
+# L'API Recherche d'entreprises n'a pas de filtre par date → ~260 pages par passage. Elle répond en ~1,5 s,
+# mais par moments en 20-35 s par page ou en 429 (surcharge de leur côté, sans en-tête Retry-After) :
+# on échoue vite au lieu d'attendre, et l'email part sans SIRENE (rattrapé par la relance horaire).
+SIRENE_MAX_SECONDS = 8 * 60   # durée maximale du balayage SIRENE
+SIRENE_PAGE_TIMEOUT = 15      # secondes par page, un seul nouvel essai
 
 # BODACC : pas de code NAF, seulement l'activité en texte libre.
 BODACC_URL = "https://bodacc-datadila.opendatasoft.com/api/explore/v2.1/catalog/datasets/annonces-commerciales/records"
@@ -148,17 +157,17 @@ def env(name):
     return value
 
 
-def http_json(req):
-    for attempt in range(8):
+def http_json(req, timeout=30, attempts=8):
+    for attempt in range(attempts):
         try:
-            with urllib.request.urlopen(req, timeout=30) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 return json.load(resp)
         except urllib.error.HTTPError as e:
-            if e.code not in (429, 500, 502, 503, 504) or attempt == 7:
+            if e.code not in (429, 500, 502, 503, 504) or attempt == attempts - 1:
                 print(f"HTTP {e.code} {req.full_url}\n{e.read().decode(errors='replace')[:800]}", file=sys.stderr)
                 raise
         except OSError:  # réseau : URLError, TimeoutError en lecture, connexion coupée
-            if attempt == 7:
+            if attempt == attempts - 1:
                 raise
         time.sleep(min(2 ** attempt, 60))  # 429 = quota/minute dépassé
 
@@ -297,19 +306,82 @@ def lookup(place_id, used, today):
 
 # --- SIRENE ----------------------------------------------------------------
 
+def sirene_fetch(today):
+    """Établissements SIRENE ciblés, indexés par SIRET : INSEE si la clé existe, sinon balayage de secours."""
+    return sirene_insee(today) if os.environ.get("INSEE_API_KEY") else sirene_sweep()
+
+
+def sirene_insee(today):
+    """Créations des SIRENE_MAX_AGE_DAYS derniers jours (et ouvertures prévues) dans le Var, via l'API INSEE."""
+    # Codes NAF 2008 et NAF 2025 : à la bascule de janvier 2027, la même requête continue de fonctionner.
+    naf = " OR ".join(f"activitePrincipaleEtablissement:{code}" for code in [*NAF_CODES, *NAF25_CODES])
+    q = (f"codePostalEtablissement:83* AND dateCreationEtablissement:"
+         f"[{today - timedelta(days=SIRENE_MAX_AGE_DAYS)} TO {today + timedelta(days=365)}] "
+         f"AND periode(({naf}) AND etatAdministratifEtablissement:A)")
+    headers = {"X-INSEE-Api-Key-Integration": os.environ["INSEE_API_KEY"], "Accept": "application/json"}
+    found, cursor = {}, "*"
+    for _ in range(10):  # ~200 résultats aujourd'hui : une page de 1 000 suffit, le curseur est une sécurité
+        query = urllib.parse.urlencode({"q": q, "nombre": 1000, "curseur": cursor})
+        data = http_json(urllib.request.Request(f"{INSEE_URL}?{query}", headers=headers), attempts=3)
+        for raw in data.get("etablissements", []):
+            if etab := insee_etab(raw):
+                found[etab["siret"]] = etab
+        if data["header"].get("curseurSuivant", cursor) == cursor:
+            break
+        cursor = data["header"]["curseurSuivant"]
+    print(f"  SIRENE (INSEE) {len(found)} établissements créés depuis {SIRENE_MAX_AGE_DAYS} jours")
+    return found
+
+
+def insee_etab(raw):
+    """Établissement INSEE → même forme que l'API Recherche d'entreprises ; None si la période en cours
+    (la première de la liste) n'est plus active ou plus dans une activité ciblée."""
+    period = (raw.get("periodesEtablissement") or [{}])[0]
+    activity = period.get("activitePrincipaleEtablissement")
+    if period.get("etatAdministratifEtablissement") != "A" or (activity not in NAF_CODES and activity not in NAF25_CODES):
+        return None
+    unit, addr = raw.get("uniteLegale") or {}, raw.get("adresseEtablissement") or {}
+    person = " ".join(filter(None, [unit.get("prenomUsuelUniteLegale") or unit.get("prenom1UniteLegale"),
+                                    unit.get("nomUsageUniteLegale") or unit.get("nomUniteLegale")]))
+    commune = addr.get("libelleCommuneEtablissement") or ""
+    street = " ".join(filter(None, [addr.get(k) for k in ("numeroVoieEtablissement", "indiceRepetitionEtablissement",
+                                                           "typeVoieEtablissement", "libelleVoieEtablissement")]))
+    return {
+        "siret": raw["siret"],
+        "nom_commercial": period.get("enseigne1Etablissement") or period.get("denominationUsuelleEtablissement"),
+        "liste_enseignes": None,
+        "nom_complet": unit.get("denominationUniteLegale") or person,
+        "activite_principale": period.get("activitePrincipaleEtablissement"),
+        "activite_principale_naf25": raw.get("activitePrincipaleNAF25Etablissement"),
+        "etat_administratif": "A",
+        "code_postal": addr.get("codePostalEtablissement") or "",
+        "libelle_commune": commune,
+        "adresse": " ".join(filter(None, [street, addr.get("codePostalEtablissement"), commune])),
+        "date_creation": raw.get("dateCreationEtablissement") or "",
+    }
+
+
 def sirene_sweep():
-    """Établissements actifs du Var dont l'activité est ciblée, indexés par SIRET."""
-    found = {}
+    """Secours sans clé : établissements actifs du Var dont l'activité est ciblée, indexés par SIRET.
+    Lève TimeoutError si l'API est trop lente (SIRENE_MAX_SECONDS) : jamais de balayage partiel utilisé."""
+    found, started, done = {}, time.time(), 0
     for code in NAF_CODES:
         page, pages = 1, 1
         while page <= pages:
+            if time.time() - started > SIRENE_MAX_SECONDS:
+                raise TimeoutError(f"API trop lente : {done} pages lues en {SIRENE_MAX_SECONDS // 60} min "
+                                   f"(~260 nécessaires), abandon")
             query = urllib.parse.urlencode({
                 "activite_principale": code, "departement": "83", "etat_administratif": "A",
                 "per_page": 25, "page": page, "minimal": "true",
                 "include": "matching_etablissements", "limite_matching_etablissements": 100,
             })
-            data = http_json(urllib.request.Request(f"{SIRENE_URL}?{query}", headers={"User-Agent": "LeadPlan"}))
+            data = http_json(urllib.request.Request(f"{SIRENE_URL}?{query}", headers={"User-Agent": "LeadPlan"}),
+                             timeout=SIRENE_PAGE_TIMEOUT, attempts=2)
             pages = data.get("total_pages", 0)
+            done += 1
+            if done % 50 == 0:
+                print(f"  SIRENE {done} pages en {time.time() - started:.0f}s")
             for company in data.get("results", []):
                 for etab in company.get("matching_etablissements") or []:
                     # Une société de coiffure peut avoir une holding ou un local commercial dans le Var.
@@ -320,7 +392,7 @@ def sirene_sweep():
                         found[etab["siret"]] = {**etab, "nom_complet": company.get("nom_complet") or ""}
             page += 1
             time.sleep(0.5)  # limite officielle 7 req/s, mais l'API renvoie des 429 si on la sollicite trop souvent
-    print(f"  SIRENE {len(found)} établissements")
+    print(f"  SIRENE {len(found)} établissements ({done} pages en {time.time() - started:.0f}s)")
     return found
 
 
@@ -337,6 +409,35 @@ def sirene_diff(found, seen, today):
         if status == "sent":
             leads.append(etab)
     return leads
+
+
+def sirene_leads(found, sirene_seen, bodacc_seen, today):
+    """Créations SIRENE du jour, hors sociétés déjà envoyées via BODACC (qui a parfois quelques jours d'avance)."""
+    creations = sirene_diff(found, sirene_seen, today)
+    bodacc_sent = {v.get("siren") for v in bodacc_seen.values() if v["status"] == "sent"}
+    for etab in [e for e in creations if e["siret"][:9] in bodacc_sent]:
+        sirene_seen[etab["siret"]]["status"] = "dup"
+        creations.remove(etab)
+    return creations
+
+
+def sirene_complement(sirene_seen, bodacc_seen, today):
+    """Relance horaire après un email parti sans SIRENE : SIRENE seul, complément envoyé s'il y a des créations.
+    Si l'API est encore trop lente, on abandonne en ~8 min et l'heure suivante réessaie."""
+    try:
+        found = sirene_fetch(today)
+    except Exception as e:
+        print(f"Complément SIRENE reporté à l'heure suivante : {type(e).__name__}: {e}")
+        return
+    creations = sirene_leads(found, sirene_seen, bodacc_seen, today)
+    if creations:
+        msg, _ = build_email([], creations, [], today, complement=True)
+        send(msg)
+        print(msg["Subject"])
+    else:
+        print("Complément SIRENE : aucune nouvelle création")
+    save_json(SIRENE_STATE_FILE, sirene_seen)
+    LAST_SENT_FILE.write_text(today.isoformat())
 
 
 # --- BODACC ----------------------------------------------------------------
@@ -512,29 +613,34 @@ def plural(n, word):
     return f"{n} {word}{'s' if n > 1 else ''}"
 
 
-def build_email(places, etabs, annonces, today, test=False, errors=None):
+def build_email(places, etabs, annonces, today, test=False, errors=None, complement=False):
     rows = sorted((google_row(p) for p in places), key=lambda r: (r["commune"], r["nom"]))
     created = sorted((sirene_row(e) for e in etabs), key=lambda r: r["cree_le"], reverse=True)
     annonces = sorted(annonces, key=lambda r: r["publie_le"], reverse=True)
 
     msg = EmailMessage()
-    msg["Subject"] = (f"{'[TEST] ' if test else ''}LeadPlan {today:%d/%m} — {plural(len(created), 'création')}, "
-                      f"{len(annonces)} BODACC, {plural(len(rows), 'fiche')} Google")
+    if complement:  # créations SIRENE rattrapées après un email du matin parti sans elles
+        msg["Subject"] = f"LeadPlan {today:%d/%m} — complément : {plural(len(created), 'création')} d'entreprise"
+    else:
+        msg["Subject"] = (f"{'[TEST] ' if test else ''}LeadPlan {today:%d/%m} — {plural(len(created), 'création')}, "
+                          f"{len(annonces)} BODACC, {plural(len(rows), 'fiche')} Google")
     msg["From"] = env("GMAIL_ADDRESS")
     msg["To"] = os.environ.get("MAIL_TO") or env("GMAIL_ADDRESS")
     warning = "".join(f"<p style='color:#b00'>⚠️ {source} indisponible aujourd'hui : {escape(error)}</p>"
                       for source, error in (errors or {}).items())
+    others = "" if complement else (
+        f"<h2>Annonces légales BODACC ({len(annonces)})</h2>{html_table(annonces, BODACC_COLUMNS)}"
+        f"<h2>Nouvelles fiches Google ({len(rows)})</h2>{html_table(rows, GOOGLE_COLUMNS)}")
     html = (f"<div style='font-family:Arial,sans-serif'>{warning}"
-            f"<h2>Créations d'entreprises ({len(created)})</h2>{html_table(created, SIRENE_COLUMNS)}"
-            f"<h2>Annonces légales BODACC ({len(annonces)})</h2>{html_table(annonces, BODACC_COLUMNS)}"
-            f"<h2>Nouvelles fiches Google ({len(rows)})</h2>{html_table(rows, GOOGLE_COLUMNS)}"
+            f"<h2>Créations d'entreprises ({len(created)})</h2>{html_table(created, SIRENE_COLUMNS)}{others}"
             f"<p style='color:#888;font-size:12px'>Créations : établissements immatriculés depuis moins de "
             f"{SIRENE_MAX_AGE_DAYS} jours (source SIRENE / INSEE), apparus depuis hier ; date future = ouverture "
             f"prévue. BODACC : créations et reprises de fonds publiées au journal officiel dont l'activité décrite "
             f"est une prestation beauté / bien-être, hors doublons avec SIRENE. Pas de téléphone dans ces deux "
             f"sources : « chercher » ouvre Google Maps. Fiches Google : apparues depuis le dernier passage, "
-            f"hors professions de santé et hors fiches dont le premier avis a plus d'un an ; « 1er avis » = date "
-            f"du plus ancien avis visible (« aucun » = âge inconnu).</p></div>")
+            f"hors professions de santé et hors fiches dont le premier avis a plus de {GOOGLE_MAX_AGE_DAYS} jours ; "
+            f"« 1er avis » = date du plus ancien avis visible (« aucun » = fiche sans avis, souvent toute "
+            f"nouvelle).</p></div>")
     msg.set_content(f"{len(created)} créations, {len(annonces)} annonces BODACC, {len(rows)} fiches Google. "
                     f"Voir la version HTML ou les CSV joints.")
     msg.add_alternative(html, subtype="html")
@@ -594,7 +700,7 @@ def main():
             used["pro"] += 1
             used["enterprise"] += 1
         save_json(USAGE_FILE, usage)
-        etabs = sorted(sirene_sweep().values(), key=lambda e: e.get("date_creation") or "", reverse=True)[:5]
+        etabs = sorted(sirene_fetch(today).values(), key=lambda e: e.get("date_creation") or "", reverse=True)[:5]
         annonces = [row for row in map(bodacc_row, bodacc_fetch(today).values()) if bodacc_relevant(row["activite"])]
         msg, html = build_email(places, etabs, annonces, today, test=True)
         if args.dry_run:
@@ -607,9 +713,12 @@ def main():
 
     if not google_seen and not args.baseline:
         sys.exit("Aucun état : lance d'abord `python leadplan.py --baseline`.")
-    if not (args.baseline or args.dry_run) and LAST_SENT_FILE.exists() \
-            and LAST_SENT_FILE.read_text().strip() == today.isoformat():
-        print("Email du jour déjà envoyé, rien à faire.")
+    last_sent = LAST_SENT_FILE.read_text().split() if LAST_SENT_FILE.exists() else []
+    if not (args.baseline or args.dry_run) and last_sent[:1] == [today.isoformat()]:
+        if "sirene" in last_sent:
+            sirene_complement(sirene_seen, bodacc_seen, today)
+        else:
+            print("Email du jour déjà envoyé, rien à faire.")
         return
 
     started = time.time()
@@ -626,13 +735,13 @@ def main():
     # SIRENE (~6 min) en parallèle du balayage Google (~6 min), dans un thread démon pour ne jamais
     # bloquer l'envoi : l'API limite parfois fortement (429), on n'attend pas au-delà de SIRENE_MAX_SECONDS.
     sirene_result = {}
-    sirene_thread = threading.Thread(target=lambda: sirene_result.update(found=safe("SIRENE", sirene_sweep)),
+    sirene_thread = threading.Thread(target=lambda: sirene_result.update(found=safe("SIRENE", lambda: sirene_fetch(today))),
                                      daemon=True)
     sirene_thread.start()
     found = sweep(args.bbox)
     print(f"{len(found)} fiches Google uniques en {time.time() - started:.0f}s")
     bodacc_found = safe("BODACC", lambda: bodacc_fetch(today))
-    sirene_thread.join(timeout=max(0, SIRENE_MAX_SECONDS - (time.time() - started)))
+    sirene_thread.join(timeout=max(0, SIRENE_MAX_SECONDS + 60 - (time.time() - started)))
     if sirene_thread.is_alive():
         errors["SIRENE"] = "API trop lente aujourd'hui (limite de requêtes) : les créations arriveront au prochain email"
         print(errors["SIRENE"])
@@ -670,12 +779,7 @@ def main():
             leads.append(place)
     save_json(USAGE_FILE, usage)  # appels réellement consommés, même en dry-run
 
-    creations = sirene_diff(sirene_found, sirene_seen, today)
-    # BODACC a parfois quelques jours d'avance : une société déjà envoyée par BODACC ne revient pas via SIRENE.
-    bodacc_sent = {v.get("siren") for v in bodacc_seen.values() if v["status"] == "sent"}
-    for etab in [e for e in creations if e["siret"][:9] in bodacc_sent]:
-        sirene_seen[etab["siret"]]["status"] = "dup"
-        creations.remove(etab)
+    creations = sirene_leads(sirene_found, sirene_seen, bodacc_seen, today)
     annonces = bodacc_diff(bodacc_found, bodacc_seen, today, {siret[:9] for siret in sirene_seen})
 
     msg, html = build_email(leads, creations, annonces, today, errors=errors_now)
@@ -685,7 +789,7 @@ def main():
         print("Aperçu : preview.html (rien envoyé, état non sauvegardé)")
         return
     send(msg)
-    LAST_SENT_FILE.write_text(today.isoformat())
+    LAST_SENT_FILE.write_text(today.isoformat() + (" sirene" if "SIRENE" in errors_now else ""))
     save_json(STATE_FILE, google_seen)
     save_json(SIRENE_STATE_FILE, sirene_seen)
     save_json(BODACC_STATE_FILE, bodacc_seen)
