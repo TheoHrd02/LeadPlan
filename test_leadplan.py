@@ -11,10 +11,10 @@ class LeadPlanTest(unittest.TestCase):
         self.assertEqual(leadplan.SEARCH_FIELDS, "places.id,nextPageToken")
 
     def test_grid_and_split_cover_bbox(self):
-        cells = leadplan.grid(leadplan.VAR_BBOX)
+        cells = leadplan.grid(leadplan.REGIONS["83"][1])
         self.assertEqual(len(cells), 9 * 13)
-        self.assertEqual(cells[0][:2], leadplan.VAR_BBOX[:2])
-        self.assertEqual(cells[-1][2:], leadplan.VAR_BBOX[2:])
+        self.assertEqual(cells[0][:2], leadplan.REGIONS["83"][1][:2])
+        self.assertEqual(cells[-1][2:], leadplan.REGIONS["83"][1][2:])
         subs = leadplan.split((43.0, 6.0, 43.1, 6.1))
         self.assertEqual({s[:2] for s in subs}, {(43.0, 6.0), (43.0, 6.05), (43.05, 6.0), (43.05, 6.05)})
 
@@ -22,18 +22,20 @@ class LeadPlanTest(unittest.TestCase):
         def place(cp, status="OPERATIONAL"):
             return {"addressComponents": [{"types": ["postal_code"], "longText": cp}], "businessStatus": status}
 
-        self.assertEqual(leadplan.classify(place("83000")), "sent")
-        self.assertEqual(leadplan.classify(place("13600")), "out_of_zone")
-        self.assertEqual(leadplan.classify(place("83400", "CLOSED_PERMANENTLY")), "closed")
-        self.assertEqual(leadplan.classify({"formattedAddress": "1 Rue X, 83990 Saint-Tropez"}), "sent")
-        self.assertEqual(leadplan.classify(None), "gone")
+        self.assertEqual(leadplan.classify(place("83000"), "83"), "sent")
+        self.assertEqual(leadplan.classify(place("13600"), "83"), "out_of_zone")
+        self.assertEqual(leadplan.classify(place("06400"), "06"), "sent")
+        self.assertEqual(leadplan.classify(place("83000"), "06"), "out_of_zone")
+        self.assertEqual(leadplan.classify(place("83400", "CLOSED_PERMANENTLY"), "83"), "closed")
+        self.assertEqual(leadplan.classify({"formattedAddress": "1 Rue X, 83990 Saint-Tropez"}, "83"), "sent")
+        self.assertEqual(leadplan.classify(None, "83"), "gone")
         for off in ("physiotherapist", "hotel", "campground", "restaurant", "general_contractor"):
-            self.assertEqual(leadplan.classify({**place("83000"), "primaryType": off}), "off_target")
-        self.assertEqual(leadplan.classify({**place("83000"), "primaryType": "body_art_service"}), "sent")
+            self.assertEqual(leadplan.classify({**place("83000"), "primaryType": off}, "83"), "off_target")
+        self.assertEqual(leadplan.classify({**place("83000"), "primaryType": "body_art_service"}, "83"), "sent")
         for name in ("Maureen Erhardy Ostéopathe D.O.", "Cabinet Sage Femme CASTILLO", "CABINET INFIRMIER ESCRIHUELA",
                      "Fayoux Caroline - Cabinet de psychothérapie", "Provencianne aide à domicile"):
-            self.assertEqual(leadplan.classify({**place("83000"), "displayName": {"text": name}}), "off_target", name)
-        self.assertEqual(leadplan.classify({**place("83000"), "displayName": {"text": "Myriam Castrec Réflexologue"}}),
+            self.assertEqual(leadplan.classify({**place("83000"), "displayName": {"text": name}}, "83"), "off_target", name)
+        self.assertEqual(leadplan.classify({**place("83000"), "displayName": {"text": "Myriam Castrec Réflexologue"}}, "83"),
                          "sent")
 
     def test_too_old(self):

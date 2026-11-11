@@ -1,4 +1,4 @@
-"""LeadPlan — nouveaux leads beauté / bien-être dans le Var, envoyés par email chaque jour.
+"""LeadPlan — nouveaux leads beauté / bien-être par département, un email par région chaque jour.
 
 Trois sources :
   - Google Places : fiches apparues depuis le dernier passage (diff de place_id).
@@ -7,12 +7,16 @@ Trois sources :
   - BODACC (gratuit, sans clé) : annonces de création et de reprise dont l'activité décrite est une
     prestation beauté / bien-être — capte les indépendants multi-activités et le bien-être que SIRENE rate.
 
+Régions : voir REGIONS ci-dessous (zone) et MAIL_TO_<code> dans .env (destinataires).
+
 Usage :
-  python leadplan.py --baseline        indexe l'existant (Google + SIRENE), n'envoie rien
-  python leadplan.py                   run quotidien : détecte, enrichit, envoie, sauvegarde
-  python leadplan.py --dry-run         idem sans envoi ni sauvegarde, écrit preview.html
+  python leadplan.py                   run quotidien, toutes les régions : détecte, enrichit, envoie, sauvegarde
+                                       (région sans état = baseline : indexe l'existant, n'envoie rien)
+  python leadplan.py --baseline        force la baseline
+  python leadplan.py --dry-run         sans envoi ni sauvegarde, écrit preview-<code>.html
   python leadplan.py --test-email      envoie un email [TEST] : 3 fiches Google connues + 5 créations récentes
-                                       (avec --dry-run : écrit preview.html sans envoyer)
+                                       (avec --dry-run : écrit preview-<code>.html sans envoyer)
+  --region 06                          une seule région (répétable)
   --bbox S,W,N,E                       limite la zone Google (tests)
   --log FICHIER                        ajoute la sortie à ce fichier (tâche planifiée via pythonw)
 """
@@ -28,6 +32,7 @@ import smtplib
 import sys
 import threading
 import time
+import traceback
 import unicodedata
 import urllib.error
 import urllib.parse
@@ -39,13 +44,25 @@ from html import escape
 from pathlib import Path
 
 ROOT = Path(__file__).parent
-STATE_FILE = ROOT / "data" / "seen.json"
-SIRENE_STATE_FILE = ROOT / "data" / "sirene_seen.json"
-BODACC_STATE_FILE = ROOT / "data" / "bodacc_seen.json"
-USAGE_FILE = ROOT / "data" / "usage.json"
-# "2026-10-29" = email du jour parti ; "2026-10-29 sirene" = parti sans SIRENE (API trop lente), la relance
-# horaire suivante refait SIRENE seul et envoie un complément.
-LAST_SENT_FILE = ROOT / "data" / "last_sent.txt"
+DATA = ROOT / "data"
+USAGE_FILE = DATA / "usage.json"  # budget Google commun à toutes les régions (une seule clé API)
+
+# Une région = un département : son balayage, son état (data/<code>/), son email.
+# Ajouter une région : une ligne ici, bbox = rectangle qui couvre tout le département (sud, ouest, nord, est ;
+# trop large ne coûte rien, le code postal filtre), puis ses destinataires dans .env :
+#   MAIL_TO_<code>=a@exemple.fr, b@exemple.fr        (absent → GMAIL_ADDRESS seul)
+# Le premier passage d'une nouvelle région indexe l'existant sans rien envoyer ; les leads arrivent le lendemain.
+# Chaque région ajoute ~7 min au passage (tâche planifiée arrêtée au bout de 45 min).
+REGIONS = {
+    "83": ("Var", (42.97, 5.65, 43.82, 6.95)),
+    "06": ("Alpes-Maritimes", (43.45, 6.60, 44.40, 7.75)),
+}
+
+
+def state_file(code, name):
+    # last_sent.txt : "2026-10-29" = email du jour parti ; "2026-10-29 sirene" = parti sans SIRENE (API trop
+    # lente), la relance horaire suivante refait SIRENE seul et envoie un complément.
+    return DATA / code / name
 
 # (requête texte, type Google Table A) — filtrage strict sur le type.
 QUERIES = [
@@ -85,7 +102,6 @@ HEALTH_NAME_RE = re.compile(r"osteo|sage-femme|sage femme|infirmi|\bkine\b|kines
                             r"psychiatr|medecin|docteur|\bdr\b|dentist|orthophon|podolog|pharmac|clinique|"
                             r"hopital|ehpad|veterin|acupunct|aide a domicile")
 
-VAR_BBOX = (42.97, 5.65, 43.82, 6.95)  # sud, ouest, nord, est
 CELL_DEG = 0.1          # grille initiale ~8 x 11 km
 SATURATED = 60          # max de résultats par requête Text Search (3 pages de 20)
 MAX_PAGES = 5           # garde-fou : 3 pages suffisent aujourd'hui
@@ -111,7 +127,7 @@ NAF_CODES = {"96.02A": "Coiffure", "96.02B": "Soins de beauté", "96.04Z": "Entr
 NAF25_CODES = {"96.21G": "Coiffure", "96.21H": "Coiffure", "96.22Y": "Soins de beauté", "96.23Y": "Entretien corporel"}
 SIRENE_MAX_AGE_DAYS = 120  # SIRET jamais vu mais créé avant → pas un lead (changement d'activité, etc.)
 # Source principale : API Sirene de l'INSEE (clé gratuite INSEE_API_KEY, 30 req/min) → une seule requête
-# filtrée sur le Var, les codes NAF et la date de création. Secours sans clé : API Recherche d'entreprises.
+# filtrée sur le département, les codes NAF et la date de création. Secours sans clé : API Recherche d'entreprises.
 INSEE_URL = "https://api.insee.fr/api-sirene/3.11/siret"
 # L'API Recherche d'entreprises n'a pas de filtre par date → ~260 pages par passage. Elle répond en ~1,5 s,
 # mais par moments en 20-35 s par page ou en 429 (surcharge de leur côté, sans en-tête Retry-After) :
@@ -268,10 +284,10 @@ def postal_code(place):
     return match.group() if match else ""
 
 
-def classify(place):
+def classify(place, dept):
     if place is None:
         return "gone"
-    if not postal_code(place).startswith("83"):
+    if not postal_code(place).startswith(dept):
         return "out_of_zone"
     if place.get("businessStatus", "OPERATIONAL") != "OPERATIONAL":
         return "closed"
@@ -291,11 +307,11 @@ def too_old(place, today):
     return bool(oldest) and oldest < (today - timedelta(days=GOOGLE_MAX_AGE_DAYS)).isoformat()
 
 
-def lookup(place_id, used, today):
+def lookup(place_id, used, today, dept):
     """Pro pour filtrer ; téléphone, site et avis seulement si la fiche est retenue, puis filtre d'âge."""
     used["pro"] += 1
     place = details(place_id, PRO_FIELDS)
-    status = classify(place)
+    status = classify(place, dept)
     if status == "sent":
         used["enterprise"] += 1
         place |= details(place_id, ENTERPRISE_FIELDS) or {}
@@ -306,16 +322,16 @@ def lookup(place_id, used, today):
 
 # --- SIRENE ----------------------------------------------------------------
 
-def sirene_fetch(today):
+def sirene_fetch(today, dept):
     """Établissements SIRENE ciblés, indexés par SIRET : INSEE si la clé existe, sinon balayage de secours."""
-    return sirene_insee(today) if os.environ.get("INSEE_API_KEY") else sirene_sweep()
+    return sirene_insee(today, dept) if os.environ.get("INSEE_API_KEY") else sirene_sweep(dept)
 
 
-def sirene_insee(today):
-    """Créations des SIRENE_MAX_AGE_DAYS derniers jours (et ouvertures prévues) dans le Var, via l'API INSEE."""
+def sirene_insee(today, dept):
+    """Créations des SIRENE_MAX_AGE_DAYS derniers jours (et ouvertures prévues) du département, via l'API INSEE."""
     # Codes NAF 2008 et NAF 2025 : à la bascule de janvier 2027, la même requête continue de fonctionner.
     naf = " OR ".join(f"activitePrincipaleEtablissement:{code}" for code in [*NAF_CODES, *NAF25_CODES])
-    q = (f"codePostalEtablissement:83* AND dateCreationEtablissement:"
+    q = (f"codePostalEtablissement:{dept}* AND dateCreationEtablissement:"
          f"[{today - timedelta(days=SIRENE_MAX_AGE_DAYS)} TO {today + timedelta(days=365)}] "
          f"AND periode(({naf}) AND etatAdministratifEtablissement:A)")
     headers = {"X-INSEE-Api-Key-Integration": os.environ["INSEE_API_KEY"], "Accept": "application/json"}
@@ -361,8 +377,8 @@ def insee_etab(raw):
     }
 
 
-def sirene_sweep():
-    """Secours sans clé : établissements actifs du Var dont l'activité est ciblée, indexés par SIRET.
+def sirene_sweep(dept):
+    """Secours sans clé : établissements actifs du département dont l'activité est ciblée, indexés par SIRET.
     Lève TimeoutError si l'API est trop lente (SIRENE_MAX_SECONDS) : jamais de balayage partiel utilisé."""
     found, started, done = {}, time.time(), 0
     for code in NAF_CODES:
@@ -372,7 +388,7 @@ def sirene_sweep():
                 raise TimeoutError(f"API trop lente : {done} pages lues en {SIRENE_MAX_SECONDS // 60} min "
                                    f"(~260 nécessaires), abandon")
             query = urllib.parse.urlencode({
-                "activite_principale": code, "departement": "83", "etat_administratif": "A",
+                "activite_principale": code, "departement": dept, "etat_administratif": "A",
                 "per_page": 25, "page": page, "minimal": "true",
                 "include": "matching_etablissements", "limite_matching_etablissements": 100,
             })
@@ -384,11 +400,11 @@ def sirene_sweep():
                 print(f"  SIRENE {done} pages en {time.time() - started:.0f}s")
             for company in data.get("results", []):
                 for etab in company.get("matching_etablissements") or []:
-                    # Une société de coiffure peut avoir une holding ou un local commercial dans le Var.
+                    # Une société de coiffure peut avoir une holding ou un local commercial dans le département.
                     targeted = (etab.get("activite_principale") in NAF_CODES
                                 or etab.get("activite_principale_naf25") in NAF25_CODES)
                     if targeted and etab.get("etat_administratif") == "A" \
-                            and str(etab.get("code_postal") or "").startswith("83"):
+                            and str(etab.get("code_postal") or "").startswith(dept):
                         found[etab["siret"]] = {**etab, "nom_complet": company.get("nom_complet") or ""}
             page += 1
             time.sleep(0.5)  # limite officielle 7 req/s, mais l'API renvoie des 429 si on la sollicite trop souvent
@@ -421,31 +437,31 @@ def sirene_leads(found, sirene_seen, bodacc_seen, today):
     return creations
 
 
-def sirene_complement(sirene_seen, bodacc_seen, today):
+def sirene_complement(code, sirene_seen, bodacc_seen, today):
     """Relance horaire après un email parti sans SIRENE : SIRENE seul, complément envoyé s'il y a des créations.
     Si l'API est encore trop lente, on abandonne en ~8 min et l'heure suivante réessaie."""
     try:
-        found = sirene_fetch(today)
+        found = sirene_fetch(today, code)
     except Exception as e:
         print(f"Complément SIRENE reporté à l'heure suivante : {type(e).__name__}: {e}")
         return
     creations = sirene_leads(found, sirene_seen, bodacc_seen, today)
     if creations:
-        msg, _ = build_email([], creations, [], today, complement=True)
+        msg, _ = build_email(code, [], creations, [], today, complement=True)
         send(msg)
         print(msg["Subject"])
     else:
         print("Complément SIRENE : aucune nouvelle création")
-    save_json(SIRENE_STATE_FILE, sirene_seen)
-    LAST_SENT_FILE.write_text(today.isoformat())
+    save_json(state_file(code, "sirene_seen.json"), sirene_seen)
+    state_file(code, "last_sent.txt").write_text(today.isoformat())
 
 
 # --- BODACC ----------------------------------------------------------------
 
-def bodacc_fetch(today):
-    """Annonces de création / reprise du Var parues sur la fenêtre, indexées par id d'annonce."""
+def bodacc_fetch(today, dept):
+    """Annonces de création / reprise du département parues sur la fenêtre, indexées par id d'annonce."""
     since = (today - timedelta(days=BODACC_DAYS)).isoformat()
-    where = (f'numerodepartement="83" and dateparution>="{since}" '
+    where = (f'numerodepartement="{dept}" and dateparution>="{since}" '
              f'and familleavis in ("creation","immatriculation","vente") and ('
              + " or ".join(f'search(listeetablissements,"{w}")' for w in BODACC_WORDS) + ")")
     records, offset = [], 0
@@ -613,19 +629,20 @@ def plural(n, word):
     return f"{n} {word}{'s' if n > 1 else ''}"
 
 
-def build_email(places, etabs, annonces, today, test=False, errors=None, complement=False):
+def build_email(code, places, etabs, annonces, today, test=False, errors=None, complement=False):
     rows = sorted((google_row(p) for p in places), key=lambda r: (r["commune"], r["nom"]))
     created = sorted((sirene_row(e) for e in etabs), key=lambda r: r["cree_le"], reverse=True)
     annonces = sorted(annonces, key=lambda r: r["publie_le"], reverse=True)
 
     msg = EmailMessage()
+    title = f"LeadPlan {REGIONS[code][0]} {today:%d/%m}"
     if complement:  # créations SIRENE rattrapées après un email du matin parti sans elles
-        msg["Subject"] = f"LeadPlan {today:%d/%m} — complément : {plural(len(created), 'création')} d'entreprise"
+        msg["Subject"] = f"{title} — complément : {plural(len(created), 'création')} d'entreprise"
     else:
-        msg["Subject"] = (f"{'[TEST] ' if test else ''}LeadPlan {today:%d/%m} — {plural(len(created), 'création')}, "
+        msg["Subject"] = (f"{'[TEST] ' if test else ''}{title} — {plural(len(created), 'création')}, "
                           f"{len(annonces)} BODACC, {plural(len(rows), 'fiche')} Google")
     msg["From"] = env("GMAIL_ADDRESS")
-    msg["To"] = os.environ.get("MAIL_TO") or env("GMAIL_ADDRESS")
+    msg["To"] = os.environ.get(f"MAIL_TO_{code}") or env("GMAIL_ADDRESS")
     warning = "".join(f"<p style='color:#b00'>⚠️ {source} indisponible aujourd'hui : {escape(error)}</p>"
                       for source, error in (errors or {}).items())
     others = "" if complement else (
@@ -667,7 +684,7 @@ def load_json(path):
 
 
 def save_json(path, state):
-    path.parent.mkdir(exist_ok=True)
+    path.parent.mkdir(parents=True, exist_ok=True)
     lines = [f"{json.dumps(k)}: {json.dumps(v)}" for k, v in sorted(state.items())]
     path.write_text("{\n" + ",\n".join(lines) + "\n}\n", "utf-8")
 
@@ -679,7 +696,8 @@ def main():
     parser.add_argument("--baseline", action="store_true")
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--test-email", action="store_true")
-    parser.add_argument("--bbox", type=lambda s: tuple(map(float, s.split(","))), default=VAR_BBOX)
+    parser.add_argument("--region", action="append", choices=list(REGIONS), help="une seule région (répétable)")
+    parser.add_argument("--bbox", type=lambda s: tuple(map(float, s.split(","))), help="zone Google réduite (tests)")
     parser.add_argument("--log", type=Path, help="ajoute la sortie à ce fichier (tâche planifiée via pythonw)")
     args = parser.parse_args()
     if args.log:
@@ -689,9 +707,22 @@ def main():
         sys.stdout.reconfigure(encoding="utf-8")
     load_dotenv()
     today = date.today()
-    google_seen, sirene_seen = load_json(STATE_FILE), load_json(SIRENE_STATE_FILE)
-    bodacc_seen, usage = load_json(BODACC_STATE_FILE), load_json(USAGE_FILE)
+    usage = load_json(USAGE_FILE)
     used = usage.setdefault(today.strftime("%Y-%m"), {"pro": 0, "enterprise": 0})
+    for code in args.region or REGIONS:
+        print(f"--- {REGIONS[code][0]} ({code}) ---")
+        try:
+            run_region(code, args, today, usage, used)
+        except Exception:  # une région en panne ne bloque pas les autres ; la relance horaire la refait
+            traceback.print_exc()
+
+
+def run_region(code, args, today, usage, used):
+    bbox = args.bbox or REGIONS[code][1]
+    google_file, sirene_file, bodacc_file, last_sent_file = (
+        state_file(code, name) for name in ("seen.json", "sirene_seen.json", "bodacc_seen.json", "last_sent.txt"))
+    google_seen, sirene_seen, bodacc_seen = map(load_json, (google_file, sirene_file, bodacc_file))
+    preview = ROOT / f"preview-{code}.html"
 
     if args.test_email:
         places = []
@@ -700,23 +731,23 @@ def main():
             used["pro"] += 1
             used["enterprise"] += 1
         save_json(USAGE_FILE, usage)
-        etabs = sorted(sirene_fetch(today).values(), key=lambda e: e.get("date_creation") or "", reverse=True)[:5]
-        annonces = [row for row in map(bodacc_row, bodacc_fetch(today).values()) if bodacc_relevant(row["activite"])]
-        msg, html = build_email(places, etabs, annonces, today, test=True)
+        etabs = sorted(sirene_fetch(today, code).values(), key=lambda e: e.get("date_creation") or "", reverse=True)[:5]
+        annonces = [row for row in map(bodacc_row, bodacc_fetch(today, code).values())
+                    if bodacc_relevant(row["activite"])]
+        msg, html = build_email(code, places, etabs, annonces, today, test=True)
         if args.dry_run:
-            (ROOT / "preview.html").write_text(html, "utf-8")
-            print("Aperçu : preview.html (rien envoyé)")
+            preview.write_text(html, "utf-8")
+            print(f"Aperçu : {preview.name} (rien envoyé)")
             return
         send(msg)
         print(f"Email de test envoyé à {msg['To']}")
         return
 
-    if not google_seen and not args.baseline:
-        sys.exit("Aucun état : lance d'abord `python leadplan.py --baseline`.")
-    last_sent = LAST_SENT_FILE.read_text().split() if LAST_SENT_FILE.exists() else []
-    if not (args.baseline or args.dry_run) and last_sent[:1] == [today.isoformat()]:
+    baseline = args.baseline or not google_seen  # région sans état : on indexe l'existant sans rien envoyer
+    last_sent = last_sent_file.read_text().split() if last_sent_file.exists() else []
+    if not (baseline or args.dry_run) and last_sent[:1] == [today.isoformat()]:
         if "sirene" in last_sent:
-            sirene_complement(sirene_seen, bodacc_seen, today)
+            sirene_complement(code, sirene_seen, bodacc_seen, today)
         else:
             print("Email du jour déjà envoyé, rien à faire.")
         return
@@ -735,12 +766,12 @@ def main():
     # SIRENE (~6 min) en parallèle du balayage Google (~6 min), dans un thread démon pour ne jamais
     # bloquer l'envoi : l'API limite parfois fortement (429), on n'attend pas au-delà de SIRENE_MAX_SECONDS.
     sirene_result = {}
-    sirene_thread = threading.Thread(target=lambda: sirene_result.update(found=safe("SIRENE", lambda: sirene_fetch(today))),
-                                     daemon=True)
+    sirene_thread = threading.Thread(
+        target=lambda: sirene_result.update(found=safe("SIRENE", lambda: sirene_fetch(today, code))), daemon=True)
     sirene_thread.start()
-    found = sweep(args.bbox)
+    found = sweep(bbox)
     print(f"{len(found)} fiches Google uniques en {time.time() - started:.0f}s")
-    bodacc_found = safe("BODACC", lambda: bodacc_fetch(today))
+    bodacc_found = safe("BODACC", lambda: bodacc_fetch(today, code))
     sirene_thread.join(timeout=max(0, SIRENE_MAX_SECONDS + 60 - (time.time() - started)))
     if sirene_thread.is_alive():
         errors["SIRENE"] = "API trop lente aujourd'hui (limite de requêtes) : les créations arriveront au prochain email"
@@ -748,7 +779,7 @@ def main():
     sirene_found = sirene_result.get("found", {})
     errors_now = dict(errors)  # copie : le thread SIRENE, s'il tourne encore, peut écrire dans l'original
 
-    if args.baseline:
+    if baseline:
         for pid in found:
             google_seen.setdefault(pid, {"first_seen": today.isoformat(), "status": "baseline"})
         for siret in sirene_found:
@@ -756,11 +787,12 @@ def main():
         for ann_id in bodacc_found:
             bodacc_seen.setdefault(ann_id, {"first_seen": today.isoformat(), "status": "baseline"})
         if not args.dry_run:
-            save_json(STATE_FILE, google_seen)
-            save_json(SIRENE_STATE_FILE, sirene_seen)
-            save_json(BODACC_STATE_FILE, bodacc_seen)
+            save_json(google_file, google_seen)
+            save_json(sirene_file, sirene_seen)
+            save_json(bodacc_file, bodacc_seen)
+            last_sent_file.write_text(today.isoformat())  # premiers leads au passage de demain
         print(f"Baseline : {len(google_seen)} fiches Google, {len(sirene_seen)} établissements SIRENE, "
-              f"{len(bodacc_seen)} annonces BODACC")
+              f"{len(bodacc_seen)} annonces BODACC (rien envoyé)")
         return
 
     for pid in found - google_seen.keys():
@@ -773,7 +805,7 @@ def main():
         if any(used[k] >= MONTHLY_BUDGET[k] for k in MONTHLY_BUDGET):
             print(f"Budget Google du mois atteint ({used}) : le reste attend le mois prochain")
             break
-        status, place = lookup(pid, used, today)
+        status, place = lookup(pid, used, today, code)
         google_seen[pid]["status"] = status
         if status == "sent":
             leads.append(place)
@@ -782,17 +814,17 @@ def main():
     creations = sirene_leads(sirene_found, sirene_seen, bodacc_seen, today)
     annonces = bodacc_diff(bodacc_found, bodacc_seen, today, {siret[:9] for siret in sirene_seen})
 
-    msg, html = build_email(leads, creations, annonces, today, errors=errors_now)
+    msg, html = build_email(code, leads, creations, annonces, today, errors=errors_now)
     print(f"{msg['Subject']} | usage du mois : {used}")
     if args.dry_run:
-        (ROOT / "preview.html").write_text(html, "utf-8")
-        print("Aperçu : preview.html (rien envoyé, état non sauvegardé)")
+        preview.write_text(html, "utf-8")
+        print(f"Aperçu : {preview.name} (rien envoyé, état non sauvegardé)")
         return
     send(msg)
-    LAST_SENT_FILE.write_text(today.isoformat() + (" sirene" if "SIRENE" in errors_now else ""))
-    save_json(STATE_FILE, google_seen)
-    save_json(SIRENE_STATE_FILE, sirene_seen)
-    save_json(BODACC_STATE_FILE, bodacc_seen)
+    last_sent_file.write_text(today.isoformat() + (" sirene" if "SIRENE" in errors_now else ""))
+    save_json(google_file, google_seen)
+    save_json(sirene_file, sirene_seen)
+    save_json(bodacc_file, bodacc_seen)
 
 
 if __name__ == "__main__":

@@ -25,7 +25,9 @@ jobs:
           API_KEY_GOOGLE_CLOUD: ${{ secrets.API_KEY_GOOGLE_CLOUD }}
           APP_PASSWORD_GOOGLE: ${{ secrets.APP_PASSWORD_GOOGLE }}
           GMAIL_ADDRESS: ${{ secrets.GMAIL_ADDRESS }}
-          MAIL_TO: ${{ secrets.MAIL_TO }}
+          INSEE_API_KEY: ${{ secrets.INSEE_API_KEY }}
+          MAIL_TO_83: ${{ secrets.MAIL_TO_83 }}
+          MAIL_TO_06: ${{ secrets.MAIL_TO_06 }}
       - name: Commit state
         run: |
           git config user.name "github-actions[bot]"

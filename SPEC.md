@@ -1,6 +1,6 @@
 # LeadPlan — Spécification
 
-Email quotidien listant les nouveaux leads beauté / bien-être (métiers Planity) dans le Var (83) : créations d'entreprises officielles (SIRENE), annonces légales de création et de reprise (BODACC) + nouvelles fiches Google. Pas d'interface. Coût cible : 0 €.
+Email quotidien listant les nouveaux leads beauté / bien-être (métiers Planity), un email par région (département : Var 83, Alpes-Maritimes 06) : créations d'entreprises officielles (SIRENE), annonces légales de création et de reprise (BODACC) + nouvelles fiches Google. Pas d'interface. Coût cible : 0 €.
 
 ---
 
@@ -90,12 +90,12 @@ Garde-fous :
 
 Limite API : 20 résultats/page, **60 max** par requête (3 pages). Une requête « coiffeur » sur Toulon sature → il faut quadriller.
 
-- Bounding box du Var : lat 42.97 → 43.82, lng 5.65 → 6.95.
+- Une bounding box par région (`REGIONS` dans `leadplan.py`) : Var lat 42.97 → 43.82, lng 5.65 → 6.95 ; Alpes-Maritimes lat 43.45 → 44.40, lng 6.60 → 7.75.
 - Grille initiale 0,1° × 0,1° (~8 × 11 km) → ~117 cellules.
 - Pour chaque cellule × chaque requête : `POST places:searchText` avec `locationRestriction.rectangle`, `includedType`, `strictTypeFiltering: true`, `languageCode: fr`, `regionCode: FR`, `pageSize: 20`, pagination via `nextPageToken`.
 - **Découpage adaptatif** : si une cellule renvoie 60 résultats (saturée) → split en 4, on recommence. Profondeur max 5 (~250 m de côté).
 - Dédoublonnage par `place_id` toutes requêtes confondues.
-- Les cellules de bord débordent sur 13 / 06 / 04 → filtrées au code postal à l'étape détails.
+- Les cellules de bord débordent sur les départements voisins (et Monaco / l'Italie pour le 06) → filtrées au code postal à l'étape détails.
 
 Estimation (15 requêtes × ~117 cellules + pagination + découpages) : ~2 500–5 000 requêtes, ~10–25 min d'exécution, 0 €.
 
@@ -116,7 +116,11 @@ Filtres :
 Bruit attendu : Google ne renvoie pas exactement les mêmes fiches d'un balayage à l'autre (mesuré : 53 → 46 → 11 → 15 « nouvelles » sur des passages rapprochés sans aucune création). Chaque passage les absorbe dans `seen.json`, le bruit décroît mais ne tombe jamais à zéro.
 
 
-### 3.5 État — `data/seen.json`
+### 3.5 Régions et état — `data/<code>/`
+
+Une région = un département. Ajouter une région : une ligne dans `REGIONS` (`leadplan.py`) avec son nom et sa bounding box, puis ses destinataires dans `.env` : `MAIL_TO_<code>=a@x.fr, b@y.fr` (absent → `GMAIL_ADDRESS` seul). Ajouter ou retirer un destinataire : modifier cette ligne de `.env`. Au premier passage, une région sans état est indexée sans rien envoyer (baseline) ; ses leads arrivent à partir du lendemain. Les régions tournent l'une après l'autre (~7 min chacune) : au-delà de 5, allonger la limite de 45 min de la tâche planifiée. Une région en erreur n'empêche pas les autres ; la relance horaire la refait.
+
+Chaque région a son dossier `data/<code>/` : `seen.json` (Google), `sirene_seen.json`, `bodacc_seen.json`, `last_sent.txt`. Seul `data/usage.json` (budget Place Details, une seule clé API) est commun.
 
 ```json
 {
@@ -134,12 +138,12 @@ On ne stocke **que** `place_id` + date + statut (conforme aux CGU Google, cf. §
 
 GitHub Actions bloqué (problème de facturation du compte GitHub) → exécution locale.
 
-- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC) puis **toutes les heures jusqu'à 23:00**, `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet. Le script sort aussitôt si l'email du jour est déjà parti (`data/last_sent.txt`) ; s'il est parti sans SIRENE (API trop lente, `last_sent.txt` = « date sirene »), la relance suivante refait SIRENE seul et envoie un email « complément » avec les créations → un lancement coupé (redémarrage Windows, veille) est rattrapé à l'heure suivante. Limite d'exécution 45 min.
+- Tâche `LeadPlan` : tous les jours 08:00 (heure du PC) puis **toutes les heures jusqu'à 23:00**, `C:\Python314\pythonw.exe leadplan.py --log leadplan.log`, dossier du projet. Le script sort aussitôt, région par région, si l'email du jour est déjà parti (`data/<code>/last_sent.txt`) ; s'il est parti sans SIRENE (API trop lente, `last_sent.txt` = « date sirene »), la relance suivante refait SIRENE seul et envoie un email « complément » avec les créations → un lancement coupé (redémarrage Windows, veille) est rattrapé à l'heure suivante. Limite d'exécution 45 min.
 - `pythonw` → aucune fenêtre ; sortie et erreurs ajoutées à `leadplan.log` (ignoré par git).
 - PC éteint ou en veille à 8h → lancée dès qu'il redémarre (« StartWhenAvailable »). Échec → 3 relances à 30 min d'intervalle.
 - Incidents des 27-28/10/2026 : redémarrage Windows 1 min après le lancement (non rattrapé à l'époque) ; boucle de pagination infinie de Google sur une requête texte seul (corrigée : `MAX_PAGES`, arrêt sur page sans nouvelle fiche).
 - Pas d'email un matin = échec (l'email part même avec 0 lead) → lire `leadplan.log`.
-- `data/seen.json` reste local ; le commiter de temps en temps sert de sauvegarde.
+- `data/` reste local ; le commiter de temps en temps sert de sauvegarde.
 - Lancer à la main : `Start-ScheduledTask LeadPlan`. Supprimer : `Unregister-ScheduledTask LeadPlan`.
 
 ### 3.6 bis GitHub Actions (désactivé, à réactiver une fois la facturation réglée)
@@ -147,7 +151,7 @@ GitHub Actions bloqué (problème de facturation du compte GitHub) → exécutio
 `.github/workflows/weekly.yml` (réactiver : `gh workflow enable weekly-leads`, puis supprimer la tâche Windows) :
 - `schedule: cron "0 6 * * *"` (tous les jours 06:00 UTC = 7h/8h Paris) + `workflow_dispatch` pour lancer à la main.
 - Steps : checkout → `python leadplan.py` → commit/push de `data/seen.json`.
-- Secrets : `API_KEY_GOOGLE_CLOUD`, `APP_PASSWORD_GOOGLE`, `GMAIL_ADDRESS`, `MAIL_TO` (optionnel, défaut = `GMAIL_ADDRESS`).
+- Secrets : `API_KEY_GOOGLE_CLOUD`, `APP_PASSWORD_GOOGLE`, `GMAIL_ADDRESS`, `INSEE_API_KEY`, `MAIL_TO_<code>` par région (optionnel, défaut = `GMAIL_ADDRESS`).
 - Échec du workflow → GitHub envoie un email d'échec automatiquement.
 - Le commit hebdo de `seen.json` maintient le repo actif (GitHub coupe les crons après 60 jours d'inactivité).
 
@@ -157,13 +161,14 @@ GitHub Actions bloqué (problème de facturation du compte GitHub) → exécutio
 LeadPlan/
 ├── leadplan.py              # tout le pipeline (~250 lignes)
 ├── test_leadplan.py         # tests minimaux (field mask, tiling, filtres)
-├── data/seen.json
+├── data/<code>/            # état par région (seen.json, sirene_seen.json, bodacc_seen.json, last_sent.txt)
+├── data/usage.json
 ├── .github/workflows/weekly.yml
 ├── .env.example             # noms des variables, sans valeurs
 └── SPEC.md
 ```
 
-Modes CLI : `--baseline` (indexe sans envoyer), `--dry-run` (calcule, affiche, n'envoie pas, n'écrit pas l'état).
+Modes CLI : `--baseline` (indexe sans envoyer), `--dry-run` (calcule, affiche, n'envoie pas, n'écrit pas l'état), `--region 06` (une seule région).
 
 ---
 
