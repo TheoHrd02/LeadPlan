@@ -27,6 +27,7 @@ import io
 import json
 import math
 import os
+import random
 import re
 import smtplib
 import sys
@@ -52,7 +53,8 @@ USAGE_FILE = DATA / "usage.json"  # budget Google commun à toutes les régions 
 # trop large ne coûte rien, le code postal filtre), puis ses destinataires dans .env :
 #   MAIL_TO_<code>=a@exemple.fr, b@exemple.fr        (absent → GMAIL_ADDRESS seul)
 # Le premier passage d'une nouvelle région indexe l'existant sans rien envoyer ; les leads arrivent le lendemain.
-# Chaque région ajoute ~7 min au passage (tâche planifiée arrêtée au bout de 45 min).
+# Chaque région ajoute 16 à 19 min au passage (20 au plus, SWEEP_MAX_SECONDS) : au-delà de deux régions, allonger la
+# limite de 45 min de la tâche planifiée.
 REGIONS = {
     "83": ("Var", (42.97, 5.65, 43.82, 6.95)),
     "06": ("Alpes-Maritimes", (43.45, 6.60, 44.40, 7.75)),
@@ -106,6 +108,20 @@ CELL_DEG = 0.1          # grille initiale ~8 x 11 km
 SATURATED = 60          # max de résultats par requête Text Search (3 pages de 20)
 MAX_PAGES = 5           # garde-fou : 3 pages suffisent aujourd'hui
 MAX_DEPTH = 5           # 0.1° / 2^5 ≈ 300 m
+# Sous 60 résultats une cellule n'est pas complète pour autant : Google renvoie les fiches qu'il juge les plus
+# pertinentes et s'arrête sans prévenir (« bien-être » sur Cannes : 18 fiches, 99 après redécoupage). Les fiches
+# récentes, peu visibles, n'apparaissaient qu'au bout de plusieurs jours. Après le balayage de base, on redécoupe
+# donc (affinage) toute cellule qui renvoie au moins SPLIT_AT fiches, jusqu'à REFINE_DEPTH.
+# Mesuré le 18/11/2026 : 06, base 8 095 fiches en 6 min, affinage +551 fiches en 10 min de plus ; 83, base
+# 8 155 fiches, affinage +402, 19 min en tout. Aller plus loin coûte du temps, presque en proportion (06 :
+# profondeur 4 → +606 fiches en 20 min ; seuil 10 → +457 en 11 min). Le réglage actuel tient à deux régions
+# (~35 min) dans les 45 min de la tâche planifiée.
+SPLIT_AT = 5
+REFINE_DEPTH = 3        # 0.1° / 2^3 ≈ 1,2 km
+SWEEP_MAX_SECONDS = 20 * 60  # par région ; au-delà l'affinage s'arrête (jour où l'API est lente), le reste demain
+# À incrémenter quand le balayage change (QUERIES, règle de découpage) : le passage suivant indexe sans les
+# envoyer les fiches que le nouveau balayage fait remonter (elles existaient déjà), au lieu d'en faire des leads.
+SWEEP_VERSION = "2"
 GOOGLE_MAX_AGE_DAYS = 60  # premier avis visible plus ancien → fiche qui n'est pas nouvelle, pas un lead
 WORKERS = 3            # ~450 req/min, sous le quota par défaut de ~600/min
 
@@ -237,26 +253,50 @@ def search_cell(query, place_type, cell):
     return ids, requests
 
 
-def sweep_query(query, place_type, bbox):
-    ids, requests, stack = set(), 0, [(cell, 0) for cell in grid(bbox)]
-    while stack:
+def sweep_query(query, place_type, cells, refine=False, deadline=math.inf):
+    """Balaye des cellules (cellule, profondeur) en redécoupant les cellules saturées, et avec refine celles
+    qui renvoient au moins SPLIT_AT fiches. Renvoie les fiches, le nombre de requêtes et les cellules restant à
+    balayer : celles à affiner (sans refine) ou celles que la limite de temps n'a pas laissé faire."""
+    ids, requests, later, stack = set(), 0, [], list(cells)
+    while stack and time.time() < deadline:
         cell, depth = stack.pop()
         found, n = search_cell(query, place_type, cell)
         ids |= found
         requests += n
+        subs = [(sub, depth + 1) for sub in split(cell)]
         if len(found) >= SATURATED:
             if depth < MAX_DEPTH:
-                stack += [(sub, depth + 1) for sub in split(cell)]
+                stack += subs
             else:
                 print(f"  ! cellule saturée à profondeur max : {query} {cell}")
-    print(f"  {query:<20} {place_type or '(texte seul)':<18} {len(ids):>5} fiches  {requests:>4} requêtes")
-    return ids
+        elif len(found) >= SPLIT_AT and depth < REFINE_DEPTH:
+            (stack if refine else later).extend(subs)
+    return ids, requests, later + stack
 
 
-def sweep(bbox):
+def sweep(bbox, deadline=math.inf):
+    """Balayage de base (cellules saturées seulement), puis affinage de toutes les requêtes jusqu'à deadline.
+    Renvoie les fiches et si l'affinage est allé au bout."""
+    cells = [(cell, 0) for cell in grid(bbox)]
+    label = lambda q: f"  {q[0]:<20} {q[1] or '(texte seul)':<18}"
     with ThreadPoolExecutor(WORKERS) as pool:
-        results = pool.map(lambda q: sweep_query(*q, bbox), QUERIES)
-        return set().union(*results)
+        base = list(pool.map(lambda q: sweep_query(*q, cells), QUERIES))
+        for q, (ids, requests, _) in zip(QUERIES, base):
+            print(f"{label(q)} {len(ids):>5} fiches  {requests:>4} requêtes")
+        found = set().union(*(ids for ids, _, _ in base))
+        print(f"Balayage de base : {len(found)} fiches, {sum(r for _, r, _ in base)} requêtes")
+
+        def refine(q, todo):  # ordre aléatoire : si la limite de temps coupe, ce ne sont pas toujours les mêmes zones
+            return sweep_query(*q, random.sample(todo, len(todo)), refine=True, deadline=deadline)
+        fine = list(pool.map(refine, QUERIES, (todo for _, _, todo in base)))
+    for q, (ids, _, _), (more, requests, left) in zip(QUERIES, base, fine):
+        print(f"{label(q)} {len(more - ids):>+5} fiches  {requests:>4} requêtes"
+              + (f"  ({len(left)} cellules non faites)" if left else ""))
+    extra = set().union(*(ids for ids, _, _ in fine)) - found
+    left = sum(len(todo) for _, _, todo in fine)
+    print(f"Affinage : +{len(extra)} fiches, {sum(r for _, r, _ in fine)} requêtes"
+          + (f", arrêté par la limite de temps ({left} cellules non faites)" if left else ""))
+    return found | extra, not left
 
 
 # --- Google : détails & filtres --------------------------------------------
@@ -719,8 +759,9 @@ def main():
 
 def run_region(code, args, today, usage, used):
     bbox = args.bbox or REGIONS[code][1]
-    google_file, sirene_file, bodacc_file, last_sent_file = (
-        state_file(code, name) for name in ("seen.json", "sirene_seen.json", "bodacc_seen.json", "last_sent.txt"))
+    google_file, sirene_file, bodacc_file, last_sent_file, sweep_file = (
+        state_file(code, name)
+        for name in ("seen.json", "sirene_seen.json", "bodacc_seen.json", "last_sent.txt", "sweep_version.txt"))
     google_seen, sirene_seen, bodacc_seen = map(load_json, (google_file, sirene_file, bodacc_file))
     preview = ROOT / f"preview-{code}.html"
 
@@ -769,7 +810,7 @@ def run_region(code, args, today, usage, used):
     sirene_thread = threading.Thread(
         target=lambda: sirene_result.update(found=safe("SIRENE", lambda: sirene_fetch(today, code))), daemon=True)
     sirene_thread.start()
-    found = sweep(bbox)
+    found, complete = sweep(bbox, started + SWEEP_MAX_SECONDS)
     print(f"{len(found)} fiches Google uniques en {time.time() - started:.0f}s")
     bodacc_found = safe("BODACC", lambda: bodacc_fetch(today, code))
     sirene_thread.join(timeout=max(0, SIRENE_MAX_SECONDS + 60 - (time.time() - started)))
@@ -790,14 +831,22 @@ def run_region(code, args, today, usage, used):
             save_json(google_file, google_seen)
             save_json(sirene_file, sirene_seen)
             save_json(bodacc_file, bodacc_seen)
+            if complete:
+                sweep_file.write_text(SWEEP_VERSION)
             last_sent_file.write_text(today.isoformat())  # premiers leads au passage de demain
         print(f"Baseline : {len(google_seen)} fiches Google, {len(sirene_seen)} établissements SIRENE, "
               f"{len(bodacc_seen)} annonces BODACC (rien envoyé)")
         return
 
+    # Balayage modifié depuis le dernier passage : ce qu'il fait remonter en plus existait déjà → indexé sans envoi,
+    # et ce jusqu'au premier passage où l'affinage va au bout (sinon le reste remonterait en leads le lendemain).
+    reindex = (sweep_file.read_text().strip() if sweep_file.exists() else "1") != SWEEP_VERSION
     for pid in found - google_seen.keys():
-        google_seen[pid] = {"first_seen": today.isoformat(), "status": "pending"}
+        google_seen[pid] = {"first_seen": today.isoformat(), "status": "baseline" if reindex else "pending"}
     pending = [pid for pid, v in google_seen.items() if v["status"] == "pending"]
+    if reindex:
+        print(f"Balayage modifié (version {SWEEP_VERSION}) : fiches inconnues indexées sans envoi, "
+              f"{len(google_seen)} connues")
     print(f"{len(pending)} nouvelles fiches Google")
 
     leads = []
@@ -825,6 +874,8 @@ def run_region(code, args, today, usage, used):
     save_json(google_file, google_seen)
     save_json(sirene_file, sirene_seen)
     save_json(bodacc_file, bodacc_seen)
+    if complete:
+        sweep_file.write_text(SWEEP_VERSION)
 
 
 if __name__ == "__main__":

@@ -1,6 +1,10 @@
+import argparse
 import json
+import tempfile
 import unittest
-from datetime import date
+from datetime import date, timedelta
+from pathlib import Path
+from unittest import mock
 
 import leadplan
 
@@ -117,6 +121,47 @@ class LeadPlanTest(unittest.TestCase):
         self.assertEqual([r["siren"] for r in leads], ["222222222", "333333333"])  # reprise gardée même si connue
         self.assertEqual({k: v["status"] for k, v in seen.items()},
                          {"a": "dup", "b": "sent", "c": "dup", "d": "sent", "e": "off_target"})
+
+    def test_sweep_refines_unsaturated_cells(self):
+        # Google tronque sans prévenir : la fiche peu visible ne sort que dans une cellule assez petite.
+        def search_cell(query, place_type, cell):
+            s, w, n, e = cell
+            small = n - s < 0.03
+            ids = {f"{cell}-{i}" for i in range(2 if small else 10)}
+            return ids | ({"cachée"} if small and s <= 43.01 < n and w <= 6.01 < e else set()), 1
+
+        top = [((43.0, 6.0, 43.1, 6.1), 0)]
+        with mock.patch.object(leadplan, "search_cell", search_cell):
+            ids, requests, todo = leadplan.sweep_query("q", None, top)  # balayage de base : 10 < 60, pas de découpage
+            self.assertEqual((len(ids), requests, len(todo)), (10, 1, 4))
+            more, requests, left = leadplan.sweep_query("q", None, todo, refine=True)
+            self.assertIn("cachée", more)
+            self.assertEqual((requests, left), (4 + 16, []))  # s'arrête sous SPLIT_AT fiches
+            # Limite de temps dépassée (API lente) : rien n'est fait, les cellules restent à faire.
+            self.assertEqual(leadplan.sweep_query("q", None, todo, refine=True, deadline=0), (set(), 0, todo))
+
+    def test_changed_sweep_indexes_silently(self):
+        # Un balayage modifié fait remonter d'un coup des fiches qui existaient déjà : ni leads, ni appels payants.
+        sent, found, complete = [], {"connue", "a", "b"}, [False, True, True]
+        lookup = mock.Mock(return_value=("sent", {"displayName": {"text": "Salon neuf"}}))
+        args = argparse.Namespace(bbox=None, test_email=False, baseline=False, dry_run=False)
+        with tempfile.TemporaryDirectory() as tmp,                 mock.patch.dict("os.environ", {"GMAIL_ADDRESS": "x@example.com"}),                 mock.patch.multiple(leadplan, DATA=Path(tmp), USAGE_FILE=Path(tmp) / "usage.json", lookup=lookup,
+                                    sweep=lambda *a: (set(found), complete.pop(0)), sirene_fetch=lambda *a: {},
+                                    bodacc_fetch=lambda *a: {}, send=sent.append):
+            leadplan.save_json(leadplan.state_file("83", "seen.json"), {"connue": {"status": "baseline"}})
+            used, today = {"pro": 0, "enterprise": 0}, date(2026, 11, 19)
+            leadplan.run_region("83", args, today, {}, used)  # état écrit par l'ancien balayage
+            seen = leadplan.load_json(leadplan.state_file("83", "seen.json"))
+            self.assertEqual({seen[k]["status"] for k in "ab"}, {"baseline"})
+            found.add("c")  # affinage coupé par la limite de temps la veille : le reste remonte, toujours en silence
+            leadplan.run_region("83", args, today + timedelta(days=1), {}, used)
+            lookup.assert_not_called()
+            self.assertIn("0 fiche Google", sent[1]["Subject"])
+
+            found.add("d")  # balayage inchangé et complet la veille : une vraie nouveauté
+            leadplan.run_region("83", args, today + timedelta(days=2), {}, used)
+            lookup.assert_called_once()
+            self.assertIn("1 fiche Google", sent[2]["Subject"])
 
 
 if __name__ == "__main__":

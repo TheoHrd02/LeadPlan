@@ -94,10 +94,20 @@ Limite API : 20 résultats/page, **60 max** par requête (3 pages). Une requête
 - Grille initiale 0,1° × 0,1° (~8 × 11 km) → ~117 cellules.
 - Pour chaque cellule × chaque requête : `POST places:searchText` avec `locationRestriction.rectangle`, `includedType`, `strictTypeFiltering: true`, `languageCode: fr`, `regionCode: FR`, `pageSize: 20`, pagination via `nextPageToken`.
 - **Découpage adaptatif** : si une cellule renvoie 60 résultats (saturée) → split en 4, on recommence. Profondeur max 5 (~250 m de côté).
+- **Affinage** (depuis le 18/11/2026) : moins de 60 résultats ne veut pas dire cellule complète. Google renvoie les fiches qu'il juge les plus pertinentes et s'arrête sans prévenir (« bien-être » sur la cellule de Cannes : 18 fiches, 99 après redécoupage) ; une fiche récente et peu visible ne sortait qu'au bout de plusieurs jours, quand ses avis la faisaient remonter (ex. « Méline LC » à Cannes, premier avis le 07/11, jamais renvoyée du 11 au 16/11). Après le balayage de base, toute cellule qui renvoie au moins `SPLIT_AT` = 5 fiches est redécoupée, jusqu'à `REFINE_DEPTH` = 3 (~1,2 km). Les requêtes filtrées par type y gagnent le plus (« spa », « bien-être », « onglerie »).
+- **Limite de temps** : `SWEEP_MAX_SECONDS` = 20 min par région. Le balayage de base va toujours au bout ; l'affinage s'arrête à la limite (jour où l'API est lente), dans un ordre aléatoire pour que les zones non faites changent d'un jour à l'autre. Le journal l'indique (« arrêté par la limite de temps »).
+- **Changement de balayage** (`SWEEP_VERSION`, à incrémenter quand `QUERIES` ou la règle de découpage changent) : le nouveau balayage fait remonter d'un coup des centaines de fiches qui existaient déjà. Tant que `data/<code>/sweep_version.txt` ne vaut pas `SWEEP_VERSION`, les fiches inconnues sont indexées (`baseline`) sans appel Place Details ni envoi ; SIRENE et BODACC partent normalement. Le fichier est écrit au premier passage où l'affinage va au bout.
 - Dédoublonnage par `place_id` toutes requêtes confondues.
 - Les cellules de bord débordent sur les départements voisins (et Monaco / l'Italie pour le 06) → filtrées au code postal à l'étape détails.
 
-Estimation (15 requêtes × ~117 cellules + pagination + découpages) : ~2 500–5 000 requêtes, ~10–25 min d'exécution, 0 €.
+Mesuré le 18/11/2026 (~570 requêtes/min, 0 €) :
+
+| | Balayage de base | Affinage | Total |
+|---|---|---|---|
+| 06 (120 cellules) | 3 500 requêtes, 6 min, 8 095 fiches | 5 600 requêtes, +551 fiches (451 jamais vues en 7 jours de passages) | 16 min |
+| 83 (117 cellules) | 3 200 requêtes, 6 min, 8 155 fiches | 7 500 requêtes, +402 fiches (223 jamais vues en 4 semaines) | 19 min |
+
+Réglages plus poussés, pour mémoire (06) : profondeur 4 → +606 fiches en 20 min ; seuil 10 → +457 fiches en 11 min. Le coût suit presque en proportion le nombre de fiches gagnées.
 
 ### 3.4 Enrichissement + filtres (Place Details)
 
@@ -113,14 +123,14 @@ Filtres :
 4. Nom contenant une profession de santé (`HEALTH_NAME_RE` : ostéopathe, sage-femme, infirmier, psychothérapeute, aide à domicile…) → `off_target` (dès l'appel Pro).
 5. **Âge** : plus ancien avis visible (champ `reviews`, 5 avis max) antérieur à `GOOGLE_MAX_AGE_DAYS` = **60 jours** → `old`, pas envoyé (seuil d'un an jusqu'au 29/10 : laissait passer des fiches avec un premier avis de fin 2025 ; on ne veut que des fiches nouvelles). Aucun avis = âge inconnu, gardé. Le nombre d'avis n'est pas un bon indicateur (un salon ouvert cette semaine peut avoir 18 avis) ; la date du premier avis l'est. Mesuré sur les 51 fiches envoyées du 23 au 26/10 : 23 avaient un premier avis de plus d'un an (16 de plus de 3 ans), 9 étaient des professions de santé ; le filtre en garde 26.
 
-Bruit attendu : Google ne renvoie pas exactement les mêmes fiches d'un balayage à l'autre (mesuré : 53 → 46 → 11 → 15 « nouvelles » sur des passages rapprochés sans aucune création). Chaque passage les absorbe dans `seen.json`, le bruit décroît mais ne tombe jamais à zéro.
+Bruit attendu : Google ne renvoie pas exactement les mêmes fiches d'un balayage à l'autre (mesuré : 53 → 46 → 11 → 15 « nouvelles » sur des passages rapprochés sans aucune création). Chaque passage les absorbe dans `seen.json`, le bruit décroît mais ne tombe jamais à zéro. L'affinage ne l'augmente pas : sur deux passages du 06 à 40 min d'écart (18/11), 49 fiches du second absentes du premier avec affinage, 59 sans.
 
 
 ### 3.5 Régions et état — `data/<code>/`
 
-Une région = un département. Ajouter une région : une ligne dans `REGIONS` (`leadplan.py`) avec son nom et sa bounding box, puis ses destinataires dans `.env` : `MAIL_TO_<code>=a@x.fr, b@y.fr` (absent → `GMAIL_ADDRESS` seul). Ajouter ou retirer un destinataire : modifier cette ligne de `.env`. Au premier passage, une région sans état est indexée sans rien envoyer (baseline) ; ses leads arrivent à partir du lendemain. Les régions tournent l'une après l'autre (~7 min chacune) : au-delà de 5, allonger la limite de 45 min de la tâche planifiée. Une région en erreur n'empêche pas les autres ; la relance horaire la refait.
+Une région = un département. Ajouter une région : une ligne dans `REGIONS` (`leadplan.py`) avec son nom et sa bounding box, puis ses destinataires dans `.env` : `MAIL_TO_<code>=a@x.fr, b@y.fr` (absent → `GMAIL_ADDRESS` seul). Ajouter ou retirer un destinataire : modifier cette ligne de `.env`. Au premier passage, une région sans état est indexée sans rien envoyer (baseline) ; ses leads arrivent à partir du lendemain. Les régions tournent l'une après l'autre (16 à 19 min chacune, 20 au plus) : au-delà de 2, allonger la limite de 45 min de la tâche planifiée. Une région en erreur n'empêche pas les autres ; la relance horaire la refait.
 
-Chaque région a son dossier `data/<code>/` : `seen.json` (Google), `sirene_seen.json`, `bodacc_seen.json`, `last_sent.txt`. Seul `data/usage.json` (budget Place Details, une seule clé API) est commun.
+Chaque région a son dossier `data/<code>/` : `seen.json` (Google), `sirene_seen.json`, `bodacc_seen.json`, `last_sent.txt`, `sweep_version.txt` (version du balayage qui a produit `seen.json`, §3.3). Seul `data/usage.json` (budget Place Details, une seule clé API) est commun.
 
 ```json
 {
@@ -161,7 +171,7 @@ GitHub Actions bloqué (problème de facturation du compte GitHub) → exécutio
 LeadPlan/
 ├── leadplan.py              # tout le pipeline (~250 lignes)
 ├── test_leadplan.py         # tests minimaux (field mask, tiling, filtres)
-├── data/<code>/            # état par région (seen.json, sirene_seen.json, bodacc_seen.json, last_sent.txt)
+├── data/<code>/            # état par région (seen.json, sirene_seen.json, bodacc_seen.json, last_sent.txt, sweep_version.txt)
 ├── data/usage.json
 ├── .github/workflows/weekly.yml
 ├── .env.example             # noms des variables, sans valeurs
@@ -243,4 +253,5 @@ Complément de SIRENE, pas un remplaçant. Mesuré sur 30 jours dans le Var (22/
 - **RGPD / prospection** : une esthéticienne en micro-entreprise = personne physique → données personnelles. Prospection B2B tolérée si le message concerne son activité pro et propose une désinscription. Ne pas revendre la liste.
 - **Faux positifs** semaines 1–2 (trous de couverture du baseline) → le seuil d'avis et le rodage les absorbent.
 - **Évolution API** : la limite de 60 résultats est « susceptible de changer » selon Google → le découpage adaptatif s'adapte tout seul.
+- **Exhaustivité** : Text Search n'est pas un annuaire, il ne garantit pas de tout renvoyer. L'affinage réduit le retard de détection sans le ramener à zéro ; une fiche est « nouvelle » le premier jour où Google nous la renvoie, pas le jour de sa création.
 - **Coûts** : le seul vrai risque financier est un field mask modifié par erreur → test automatisé + quotas + alerte budget.
